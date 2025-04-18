@@ -35,10 +35,28 @@ import {
   TabPanel,
   Tooltip,
   Heading,
-  MenuDivider
+  MenuDivider,
+  Textarea,
+  Modal,
+  ModalOverlay,
+  ModalContent,
+  ModalHeader,
+  ModalBody,
+  ModalCloseButton,
+  ModalFooter,
+  Progress,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+  PopoverBody,
+  PopoverArrow,
+  Link,
+  Icon
 } from '@chakra-ui/react';
-import { AddIcon, SettingsIcon, BellIcon } from '@chakra-ui/icons';
+import { AddIcon, SettingsIcon, BellIcon, EditIcon, DeleteIcon, AttachmentIcon, CheckIcon } from '@chakra-ui/icons';
 import AuthForm from './components/AuthForm';
+import { FaPaperPlane } from 'react-icons/fa';
+import { FiPaperclip, FiEdit2, FiTrash2, FiCheck } from 'react-icons/fi';
 
 // Optional: If you have a notification sound file in your public folder
 // Uncomment this line to add notification sounds
@@ -60,6 +78,10 @@ const App = () => {
   const [notifications, setNotifications] = useState([]);
   const [viewMembersOpen, setViewMembersOpen] = useState(false);
   const [chatMembers, setChatMembers] = useState([]);
+  const [editingMessage, setEditingMessage] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [typingUsers, setTypingUsers] = useState({});
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   // Move all refs to the top
   const ws = useRef(null);
@@ -80,6 +102,8 @@ const App = () => {
   const successfulConnections = useRef(0);
   const lastSuccessfulConnection = useRef(0);
   const recentSystemMessages = useRef([]);
+  const typingTimeoutRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   // Drawer state
   const { 
@@ -162,7 +186,6 @@ const App = () => {
     // Handle chat history messages
     if (data.type === 'chat_history') {
       if (data.chatId && data.messages && Array.isArray(data.messages)) {
-        // Verify each message has a valid sender
         const validMessages = data.messages.filter(msg => msg.sender && typeof msg.sender === 'string');
         
         setChatMessages(prev => ({
@@ -177,18 +200,56 @@ const App = () => {
       return;
     }
 
+    // Handle edited messages
+    if (data.type === 'message_edited') {
+      setChatMessages(prev => {
+        const chatMessages = prev[data.chatId] || [];
+        return {
+          ...prev,
+          [data.chatId]: chatMessages.map(msg => 
+            msg._id === data.messageId 
+              ? { 
+                  ...msg, 
+                  content: data.content,
+                  isEdited: true,
+                  editedAt: data.editedAt,
+                  editHistory: data.editHistory
+                }
+              : msg
+          )
+        };
+      });
+
+      // Update chat list if it was the last message
+      setChats(prevChats => {
+        return prevChats.map(chat => {
+          if (chat._id === data.chatId && chat.lastMessage?._id === data.messageId) {
+            return {
+              ...chat,
+              lastMessage: {
+                ...chat.lastMessage,
+                content: data.content,
+                isEdited: true,
+                editedAt: data.editedAt
+              }
+            };
+          }
+          return chat;
+        });
+      });
+    }
+
     // Handle new messages
     if (data.messageData) {
-      // Verify the message has a valid sender
       if (!data.messageData.sender || typeof data.messageData.sender !== 'string') {
         console.error('Invalid message sender:', data.messageData);
         return;
       }
 
+      // Update messages in the chat
       setChatMessages(prev => {
         const chatMessages = prev[data.chatId] || [];
         
-        // Check if message already exists
         const isDuplicate = chatMessages.some(msg => 
           (msg._id && msg._id === data.messageData._id) || 
           (msg.sender === data.messageData.sender && 
@@ -196,14 +257,33 @@ const App = () => {
            msg.content === data.messageData.content)
         );
         
-        if (isDuplicate) {
-          return prev;
-        }
+        if (isDuplicate) return prev;
 
         return {
           ...prev,
           [data.chatId]: [...chatMessages, data.messageData]
         };
+      });
+
+      // Update the chats list to show the latest message
+      setChats(prevChats => {
+        const updatedChats = prevChats.map(chat => {
+          if (chat._id === data.chatId) {
+            return {
+              ...chat,
+              lastMessage: data.messageData,
+              lastActivity: new Date().toISOString()
+            };
+          }
+          return chat;
+        });
+
+        // Sort chats by last activity
+        return updatedChats.sort((a, b) => {
+          const timeA = a.lastActivity || a.createdAt;
+          const timeB = b.lastActivity || b.createdAt;
+          return new Date(timeB) - new Date(timeA);
+        });
       });
 
       // Handle unread counts and notifications
@@ -724,6 +804,48 @@ const App = () => {
             case 'system':
               handleSystemMessage(data);
               break;
+            case 'typing_status':
+              setTypingUsers(prev => {
+                const newTypingUsers = { ...prev };
+                if (data.chatId && data.username && data.username !== user?.username) {
+                  if (!newTypingUsers[data.chatId]) {
+                    newTypingUsers[data.chatId] = new Set();
+                  }
+                  
+                  if (data.isTyping) {
+                    newTypingUsers[data.chatId].add(data.username);
+                  } else {
+                    newTypingUsers[data.chatId].delete(data.username);
+                    if (newTypingUsers[data.chatId].size === 0) {
+                      delete newTypingUsers[data.chatId];
+                    }
+                  }
+                }
+                return newTypingUsers;
+              });
+              break;
+            case 'message_edited':
+              handleChatMessage(data);
+              break;
+            case 'message_deleted':
+              handleChatMessage(data);
+              break;
+            case 'message_read':
+              setChatMessages(prev => {
+                const chatMessages = prev[data.chatId] || [];
+                return {
+                  ...prev,
+                  [data.chatId]: chatMessages.map(msg => 
+                    msg._id === data.messageId 
+                      ? { 
+                          ...msg, 
+                          readBy: [...new Set([...msg.readBy, data.username])]
+                        }
+                      : msg
+                  )
+                };
+              });
+              break;
             default:
               console.log('Unknown message type:', data.type);
           }
@@ -1040,63 +1162,113 @@ const App = () => {
 
   // Chat list component
   const ChatsList = () => (
-    <VStack spacing={2} align="stretch" overflowY="auto" h="calc(100vh - 200px)">
+    <VStack spacing={3} align="stretch" overflowY="auto" h="calc(100vh - 200px)" px={2}>
       {chats.map((chat) => {
-        // For direct chats, show the other person's name
         const chatName = chat.type === 'direct' 
           ? chat.otherParticipants?.[0] || chat.name
           : chat.name;
           
-        // Get unread count for this chat
         const unreadCount = unreadCounts[chat._id] || 0;
-        
-        // Check if user is online
         const isOnline = chat.type === 'direct' && onlineUsers.includes(chatName);
         
         return (
           <Box 
             key={chat._id}
-            p={3}
-            bg={activeChat === chat._id ? "blue.100" : "white"}
-            borderRadius="md"
+            p={4}
+            bg={activeChat === chat._id ? "blue.50" : "white"}
+            borderRadius="lg"
             cursor="pointer"
-            _hover={{ bg: "gray.100" }}
+            _hover={{ 
+              bg: activeChat === chat._id ? "blue.100" : "gray.50",
+              transform: "translateY(-1px)",
+              shadow: "sm"
+            }}
             onClick={() => selectChat(chat._id)}
             position="relative"
+            transition="all 0.2s"
+            borderWidth="1px"
+            borderColor={activeChat === chat._id ? "blue.200" : "gray.200"}
           >
-            <HStack spacing={3}>
-              <Avatar 
-                name={chatName} 
-                bg={isOnline ? "green.500" : "gray.400"}
-              />
+            <HStack spacing={3} align="start">
+              <Box position="relative">
+                <Avatar 
+                  name={chatName} 
+                  bg={chat.type === 'group' ? "purple.500" : "blue.500"}
+                  size="md"
+                />
+                {isOnline && (
+                  <Box
+                    position="absolute"
+                    bottom={0}
+                    right={0}
+                    w="3.5"
+                    h="3.5"
+                    bg="green.400"
+                    borderRadius="full"
+                    borderWidth="2px"
+                    borderColor="white"
+                  />
+                )}
+              </Box>
               <VStack spacing={0} align="start" flex={1}>
-                <Text fontWeight="bold">{chatName}</Text>
-                <Text fontSize="sm" color="gray.500" noOfLines={1}>
-                  {chat.lastMessage ? (
-                    <>
-                      {chat.lastMessage.sender}: {chat.lastMessage.content}
-                    </>
-                  ) : (
-                    <Text as="i">No messages yet</Text>
+                <HStack spacing={2} width="100%" justify="space-between">
+                  <Text fontWeight="semibold" fontSize="md">{chatName}</Text>
+                  {chat.lastMessage && (
+                    <Text fontSize="xs" color="gray.500">
+                      {new Date(chat.lastMessage.timestamp).toLocaleTimeString([], { 
+                        hour: '2-digit', 
+                        minute: '2-digit' 
+                      })}
+                    </Text>
                   )}
-                </Text>
+                </HStack>
+                {chat.lastMessage && (
+                  <Text 
+                    fontSize="sm" 
+                    color={unreadCount > 0 ? "gray.900" : "gray.500"} 
+                    noOfLines={1}
+                    fontWeight={unreadCount > 0 ? "medium" : "normal"}
+                    mt={1}
+                    width="100%"
+                  >
+                    {chat.type === 'group' ? (
+                      <>
+                        <Text as="span" fontWeight="medium" color="gray.700">
+                          {chat.lastMessage.sender}:
+                        </Text>
+                        {' '}
+                      </>
+                    ) : null}
+                    {chat.lastMessage.content}
+                  </Text>
+                )}
+                {!chat.lastMessage && (
+                  <Text 
+                    fontSize="sm" 
+                    color="gray.500" 
+                    fontStyle="italic"
+                    mt={1}
+                  >
+                    No messages yet
+                  </Text>
+                )}
               </VStack>
-              {chat.lastMessage && (
-                <Text fontSize="xs" color="gray.500">
-                  {new Date(chat.lastMessage.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </Text>
-              )}
               {unreadCount > 0 && (
-                <Badge 
-                  borderRadius="full" 
-                  px={2} 
-                  colorScheme="green" 
-                  position="absolute"
-                  right={3}
-                  top={3}
+                <Flex
+                  borderRadius="full"
+                  bg="blue.500"
+                  color="white"
+                  px={2}
+                  py={1}
+                  minW="20px"
+                  h="20px"
+                  alignItems="center"
+                  justifyContent="center"
+                  fontSize="xs"
+                  fontWeight="bold"
                 >
                   {unreadCount}
-                </Badge>
+                </Flex>
               )}
             </HStack>
           </Box>
@@ -1107,6 +1279,53 @@ const App = () => {
 
   // Chat detail component
   const ChatDetail = () => {
+    const chatContainerRef = useRef(null);
+    const isScrolledUpRef = useRef(false);
+
+    // Check if user has scrolled up
+    const checkIfScrolledUp = useCallback(() => {
+      if (chatContainerRef.current) {
+        const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
+        isScrolledUpRef.current = scrollHeight - (scrollTop + clientHeight) > 100;
+      }
+    }, []);
+
+    // Add scroll listener
+    useEffect(() => {
+      const container = chatContainerRef.current;
+      if (container) {
+        container.addEventListener('scroll', checkIfScrolledUp);
+        return () => container.removeEventListener('scroll', checkIfScrolledUp);
+      }
+    }, [checkIfScrolledUp]);
+
+    // Smart scroll behavior
+    const scrollToBottom = useCallback((behavior = 'smooth') => {
+      if (!isScrolledUpRef.current) {
+        messagesEndRef.current?.scrollIntoView({ behavior });
+      }
+    }, []);
+
+    // Scroll on new messages or chat change
+    useEffect(() => {
+      if (activeChat && chatMessages[activeChat]) {
+        const messages = chatMessages[activeChat];
+        const lastMessage = messages[messages.length - 1];
+        
+        // Only scroll if it's a new message (not when typing)
+        if (lastMessage && lastMessage.sender) {
+          scrollToBottom();
+        }
+      }
+    }, [activeChat, chatMessages, scrollToBottom]);
+
+    // Initial scroll when changing chats
+    useEffect(() => {
+      if (activeChat) {
+        scrollToBottom('auto');
+      }
+    }, [activeChat, scrollToBottom]);
+
     // Move all hooks to the top level
     const handleInputChange = useCallback((e) => {
       setMessage(e.target.value);
@@ -1212,12 +1431,28 @@ const App = () => {
         </Flex>
         
         <VStack 
+          ref={chatContainerRef}
           spacing={4} 
           p={4} 
           overflowY="auto" 
           flex={1}
           bg="gray.50"
           align="stretch"
+          css={{
+            '&::-webkit-scrollbar': {
+              width: '8px',
+            },
+            '&::-webkit-scrollbar-track': {
+              background: '#f1f1f1',
+            },
+            '&::-webkit-scrollbar-thumb': {
+              background: '#888',
+              borderRadius: '4px',
+            },
+            '&::-webkit-scrollbar-thumb:hover': {
+              background: '#555',
+            },
+          }}
         >
           {messages.length === 0 ? (
             <Box textAlign="center" my={10}>
@@ -1225,48 +1460,86 @@ const App = () => {
             </Box>
           ) : (
             messages.map((msg, index) => (
-              <Box
-                key={msg._id || `${msg.timestamp}-${index}`}
-                bg={msg.sender === user?.username ? "blue.100" : "white"}
-                p={3}
-                borderRadius="lg"
-                alignSelf={msg.sender === user?.username ? "flex-end" : "flex-start"}
-                maxW="70%"
-                boxShadow="sm"
-              >
-                {msg.sender !== user?.username && (
-                  <Text fontSize="xs" fontWeight="bold" color="gray.500" mb={1}>
-                    {msg.sender}
-                  </Text>
-                )}
-                <Text wordBreak="break-word">{msg.content}</Text>
-                <Text fontSize="xs" color="gray.500" textAlign="right" mt={1}>
-                  {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </Text>
-              </Box>
+              <Message key={msg._id || `${msg.timestamp}-${index}`} message={msg} isOwnMessage={msg.sender === user?.username} />
             ))
           )}
-          <div ref={messagesEndRef} />
+          <div ref={messagesEndRef} style={{ height: '1px', width: '100%' }} />
         </VStack>
         
-        <Flex p={4} bg="white" borderTopWidth={1}>
+        <Flex 
+          p={4} 
+          bg="white" 
+          borderTopWidth={1} 
+          position="relative"
+          direction="column"
+        >
+          {uploadProgress > 0 && (
+            <Progress 
+              value={uploadProgress} 
+              size="xs" 
+              colorScheme="blue" 
+              position="absolute" 
+              top={0} 
+              left={0} 
+              right={0} 
+            />
+          )}
+          
           <Input
-            ref={messageInputRef}
-            value={message}
-            onChange={handleInputChange}
-            onKeyDown={handleKeyDown}
-            placeholder="Type your message..."
-            mr={2}
-            size="md"
-            autoComplete="off"
+            type="file"
+            ref={fileInputRef}
+            display="none"
+            onChange={(e) => {
+              if (e.target.files?.[0]) {
+                handleFileUpload(e.target.files[0]);
+              }
+              e.target.value = ''; // Reset input
+            }}
+            accept="image/*,.pdf,.doc,.docx"
           />
-          <Button
-            colorScheme="blue"
-            onClick={handleSendClick}
-            isDisabled={!message.trim()}
-          >
-            Send
-          </Button>
+          
+          {typingUsers[activeChat]?.size > 0 && (
+            <Text
+              fontSize="sm"
+              color="gray.500"
+              mb={2}
+            >
+              {Array.from(typingUsers[activeChat]).join(', ')} {
+                typingUsers[activeChat].size === 1 ? 'is' : 'are'
+              } typing...
+            </Text>
+          )}
+          
+          <HStack spacing={2}>
+            <IconButton
+              icon={<AttachmentIcon />}
+              onClick={() => fileInputRef.current?.click()}
+              aria-label="Attach file"
+              variant="ghost"
+            />
+            <Input
+              ref={messageInputRef}
+              value={message}
+              onChange={(e) => {
+                setMessage(e.target.value);
+                if (activeChat) {
+                  handleTyping(activeChat);
+                }
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder="Type your message..."
+              size="md"
+              autoComplete="off"
+            />
+            <Button
+              colorScheme="blue"
+              onClick={handleSendClick}
+              isDisabled={!message.trim()}
+              rightIcon={<FaPaperPlane />}
+            >
+              Send
+            </Button>
+          </HStack>
         </Flex>
       </Box>
     );
@@ -1509,6 +1782,451 @@ const App = () => {
       }));
     }
   }, []);
+
+  // Update the typing handler
+  const handleTyping = useCallback((chatId) => {
+    if (!ws.current || !user || !chatId) return;
+
+    // Clear any existing timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+
+    // Send typing start
+    ws.current.send(JSON.stringify({
+      type: 'typing_start',
+      chatId: chatId
+    }));
+
+    // Set timeout to send typing stop
+    typingTimeoutRef.current = setTimeout(() => {
+      if (ws.current) {
+        ws.current.send(JSON.stringify({
+          type: 'typing_stop',
+          chatId: chatId
+        }));
+      }
+    }, 2000);
+  }, [user]);
+
+  // Add file upload handler
+  const handleFileUpload = useCallback(async (file) => {
+    if (!file || !activeChat) return;
+    
+    // Check file size (10MB limit)
+    if (file.size > 10 * 1024 * 1024) {
+      toast({
+        title: 'Error',
+        description: 'File size must be less than 10MB',
+        status: 'error',
+        duration: 3000,
+        isClosable: true
+      });
+      return;
+    }
+    
+    setUploadProgress(1); // Start progress
+    
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      
+      console.log('Starting file upload:', {
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size
+      });
+
+      // Use the full server URL
+      const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+      const response = await fetch(`${API_URL}/api/upload`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`
+        },
+        body: formData
+      });
+      
+      console.log('Upload response status:', response.status);
+      
+      // First check if the response is JSON
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        throw new Error('Server returned non-JSON response. Please try again.');
+      }
+      
+      const responseData = await response.json();
+      console.log('Upload response:', responseData);
+      
+      if (!response.ok) {
+        throw new Error(responseData.error || 'Upload failed');
+      }
+      
+      // Send file message
+      if (ws.current?.readyState === WebSocket.OPEN) {
+        const messageData = {
+          type: 'chat_message',
+          chatId: activeChat,
+          content: file.name,
+          fileUrl: responseData.fileUrl,
+          fileName: file.name,
+          fileSize: file.size,
+          fileType: file.type
+        };
+        
+        console.log('Sending file message:', messageData);
+        ws.current.send(JSON.stringify(messageData));
+        
+        setUploadProgress(100);
+        setTimeout(() => setUploadProgress(0), 1000);
+        
+        toast({
+          title: 'Success',
+          description: 'File uploaded successfully',
+          status: 'success',
+          duration: 3000,
+          isClosable: true
+        });
+      }
+    } catch (error) {
+      console.error('File upload error:', error);
+      toast({
+        title: 'Upload Failed',
+        description: error.message || 'Failed to upload file. Please try again.',
+        status: 'error',
+        duration: 5000,
+        isClosable: true
+      });
+      setUploadProgress(0);
+    }
+  }, [activeChat, accessToken, toast]);
+
+  // Add WebSocket message handler for edits and deletes
+  useEffect(() => {
+    if (!ws.current) return;
+
+    const handleWebSocketMessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        
+        if (data.type === 'message_edited') {
+          // Update chat messages
+          setChatMessages(prev => {
+            const chatMessages = prev[data.chatId] || [];
+            return {
+              ...prev,
+              [data.chatId]: chatMessages.map(msg => 
+                msg._id === data.messageId 
+                  ? { 
+                      ...msg, 
+                      content: data.content, 
+                      isEdited: true,
+                      editedAt: data.editedAt,
+                      editHistory: data.editHistory
+                    }
+                  : msg
+              )
+            };
+          });
+
+          // Update chat list if it was the last message
+          setChats(prevChats => 
+            prevChats.map(chat => {
+              if (chat._id === data.chatId && chat.lastMessage?._id === data.messageId) {
+                return {
+                  ...chat,
+                  lastMessage: {
+                    ...chat.lastMessage,
+                    content: data.content,
+                    isEdited: true,
+                    editedAt: data.editedAt
+                  }
+                };
+              }
+              return chat;
+            })
+          );
+        }
+        
+        if (data.type === 'message_deleted') {
+          // Remove message from chat messages
+          setChatMessages(prev => {
+            const chatMessages = prev[data.chatId] || [];
+            return {
+              ...prev,
+              [data.chatId]: chatMessages.map(msg => 
+                msg._id === data.messageId
+                  ? {
+                      ...msg,
+                      content: 'This message has been deleted',
+                      isDeleted: true,
+                      deletedAt: data.deletedAt
+                    }
+                  : msg
+              )
+            };
+          });
+
+          // Update chat list if it was the last message
+          setChats(prevChats => 
+            prevChats.map(chat => {
+              if (chat._id === data.chatId && chat.lastMessage?._id === data.messageId) {
+                return {
+                  ...chat,
+                  lastMessage: {
+                    ...chat.lastMessage,
+                    content: 'This message has been deleted',
+                    isDeleted: true,
+                    deletedAt: data.deletedAt
+                  }
+                };
+              }
+              return chat;
+            })
+          );
+        }
+      } catch (error) {
+        console.error('Error handling WebSocket message:', error);
+      }
+    };
+
+    ws.current.addEventListener('message', handleWebSocketMessage);
+    return () => ws.current?.removeEventListener('message', handleWebSocketMessage);
+  }, [ws]);
+
+  // Update Message component with better edit and delete handling
+  const Message = ({ message, isOwnMessage }) => {
+    const [isEditing, setIsEditing] = useState(false);
+    const [editedContent, setEditedContent] = useState(message.content);
+    const [canEdit, setCanEdit] = useState(false);
+    const messageRef = useRef(null);
+    const editInputRef = useRef(null);
+    const toast = useToast();
+
+    // Reset edited content when message changes
+    useEffect(() => {
+      setEditedContent(message.content);
+    }, [message.content]);
+
+    // Check if message can be edited (within 20 minutes)
+    useEffect(() => {
+      const checkEditability = () => {
+        const messageTime = new Date(message.timestamp).getTime();
+        const currentTime = new Date().getTime();
+        const timeDiff = currentTime - messageTime;
+        const canStillEdit = timeDiff <= 20 * 60 * 1000; // 20 minutes in milliseconds
+        setCanEdit(canStillEdit && isOwnMessage && !message.isDeleted);
+      };
+      
+      checkEditability();
+      const interval = setInterval(checkEditability, 60000);
+      return () => clearInterval(interval);
+    }, [message.timestamp, isOwnMessage, message.isDeleted]);
+
+    // Focus input when editing starts
+    useEffect(() => {
+      if (isEditing && editInputRef.current) {
+        editInputRef.current.focus();
+      }
+    }, [isEditing]);
+
+    const handleEdit = () => {
+      if (!canEdit) {
+        toast({
+          title: "Can't edit message",
+          description: "Messages can only be edited within 20 minutes of sending",
+          status: 'warning',
+          duration: 3000,
+          isClosable: true
+        });
+        return;
+      }
+      setIsEditing(true);
+      setEditedContent(message.content);
+    };
+
+    const handleSave = () => {
+      if (!canEdit) {
+        setIsEditing(false);
+        return;
+      }
+
+      const trimmedContent = editedContent.trim();
+      if (trimmedContent && trimmedContent !== message.content && ws.current?.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({
+          type: 'edit_message',
+          messageId: message._id,
+          chatId: activeChat,
+          content: trimmedContent
+        }));
+      }
+      setIsEditing(false);
+    };
+
+    const handleDelete = () => {
+      if (window.confirm('Are you sure you want to delete this message?')) {
+        if (ws.current?.readyState === WebSocket.OPEN) {
+          ws.current.send(JSON.stringify({
+            type: 'delete_message',
+            messageId: message._id,
+            chatId: activeChat
+          }));
+        }
+      }
+    };
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSave();
+      } else if (e.key === 'Escape') {
+        setIsEditing(false);
+        setEditedContent(message.content);
+      }
+    };
+
+    // Format the edited time
+    const getEditedInfo = () => {
+      if (!message.isEdited || !message.editedAt) return null;
+      const editedTime = new Date(message.editedAt).toLocaleTimeString([], { 
+        hour: '2-digit', 
+        minute: '2-digit' 
+      });
+      return `edited ${editedTime}`;
+    };
+
+    return (
+      <Box
+        ref={messageRef}
+        role="group"
+        position="relative"
+        alignSelf={isOwnMessage ? "flex-end" : "flex-start"}
+        maxW={{ base: "85%", md: "70%" }}
+        mb={2}
+      >
+        <Box
+          bg={isOwnMessage ? "blue.500" : "gray.100"}
+          color={isOwnMessage ? "white" : "gray.800"}
+          px={4}
+          py={3}
+          borderRadius="lg"
+          borderBottomRightRadius={isOwnMessage ? 0 : "lg"}
+          borderBottomLeftRadius={isOwnMessage ? "lg" : 0}
+          shadow="sm"
+          opacity={message.isDeleted ? 0.7 : 1}
+        >
+          {!isOwnMessage && (
+            <Text fontSize="sm" fontWeight="medium" mb={1} color={isOwnMessage ? "blue.100" : "gray.600"}>
+              {message.sender}
+            </Text>
+          )}
+          
+          {isEditing ? (
+            <Textarea
+              ref={editInputRef}
+              value={editedContent}
+              onChange={(e) => setEditedContent(e.target.value)}
+              onKeyDown={handleKeyDown}
+              autoFocus
+              rows={2}
+              resize="none"
+              bg={isOwnMessage ? "blue.400" : "white"}
+              color={isOwnMessage ? "white" : "gray.800"}
+              border="none"
+              _focus={{
+                border: "none",
+                boxShadow: "none"
+              }}
+            />
+          ) : (
+            <VStack align="start" spacing={1} width="100%">
+              <HStack spacing={2} width="100%" align="center">
+                <Text 
+                  whiteSpace="pre-wrap" 
+                  wordBreak="break-word"
+                  fontStyle={message.isDeleted ? "italic" : "normal"}
+                  color={message.isDeleted ? (isOwnMessage ? "whiteAlpha.800" : "gray.500") : "inherit"}
+                >
+                  {message.content}
+                </Text>
+                {message.isDeleted && (
+                  <Badge 
+                    colorScheme="red" 
+                    variant="subtle"
+                    fontSize="xs"
+                  >
+                    deleted
+                  </Badge>
+                )}
+                {message.isEdited && !message.isDeleted && (
+                  <Tooltip 
+                    label={getEditedInfo()} 
+                    placement="top" 
+                    hasArrow
+                  >
+                    <Badge 
+                      colorScheme={isOwnMessage ? "blue" : "gray"}
+                      variant="subtle"
+                      fontSize="xs"
+                    >
+                      edited
+                    </Badge>
+                  </Tooltip>
+                )}
+              </HStack>
+            </VStack>
+          )}
+        </Box>
+        
+        {isOwnMessage && !message.isDeleted && message.type !== 'file' && (
+          <HStack 
+            position="absolute" 
+            top={0}
+            right="100%"
+            px={2}
+            opacity={0}
+            transition="opacity 0.2s"
+            _groupHover={{ opacity: 1 }}
+            bg="white"
+            borderRadius="md"
+            shadow="sm"
+          >
+            {canEdit && (
+              <IconButton
+                size="sm"
+                variant="ghost"
+                icon={isEditing ? <CheckIcon /> : <EditIcon />}
+                onClick={isEditing ? handleSave : handleEdit}
+                aria-label={isEditing ? "Save edit" : "Edit message"}
+              />
+            )}
+            {!isEditing && (
+              <IconButton
+                size="sm"
+                variant="ghost"
+                colorScheme="red"
+                icon={<DeleteIcon />}
+                onClick={handleDelete}
+                aria-label="Delete message"
+              />
+            )}
+          </HStack>
+        )}
+        
+        <Text 
+          fontSize="xs" 
+          color="gray.500" 
+          textAlign={isOwnMessage ? "right" : "left"}
+          mt={1}
+        >
+          {new Date(message.timestamp).toLocaleTimeString([], { 
+            hour: '2-digit', 
+            minute: '2-digit' 
+          })}
+        </Text>
+      </Box>
+    );
+  };
 
   // Render the connection status indicator
   const ConnectionStatus = () => {

@@ -8,10 +8,37 @@ const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 const { body, validationResult } = require('express-validator');
 const mongoose = require('mongoose');
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// Configure Cloudinary storage
+const storage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'chat_attachments',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'pdf', 'doc', 'docx'],
+    resource_type: 'auto'
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
 
 // MongoDB connection
 const MONGODB_URI = 'mongodb+srv://ankitsuperku:kdTeeHosKEl1HSLw@cluster0.5melvxj.mongodb.net/chat_app?retryWrites=true&w=majority&appName=Cluster0';
@@ -50,20 +77,43 @@ const chatSchema = new mongoose.Schema({
 
 const messageSchema = new mongoose.Schema({
   chatId: { type: mongoose.Schema.Types.ObjectId, ref: 'Chat', required: true },
-  type: { type: String, required: true },
+  type: { type: String, required: true, enum: ['text', 'file', 'image', 'edited', 'deleted'] },
   content: { type: String, required: true },
   sender: { type: String, required: true },
   timestamp: { type: Date, default: Date.now },
   readBy: [{ type: String }], // List of usernames who have read this message
-  deletedFor: [{ type: String }] // List of usernames who have deleted this message
+  deletedFor: [{ type: String }], // List of usernames who have deleted this message
+  fileUrl: { type: String }, // URL for file attachments
+  fileName: { type: String }, // Original file name
+  fileSize: { type: Number }, // File size in bytes
+  fileType: { type: String }, // MIME type of the file
+  editHistory: [{ // Track message edits
+    content: { type: String, required: true },
+    editedAt: { type: Date, default: Date.now }
+  }],
+  isEdited: { type: Boolean, default: false },
+  editedAt: { type: Date },
+  isDeleted: { type: Boolean, default: false },
+  deletedAt: { type: Date }
 });
+
+// Add indexes for better query performance
+messageSchema.index({ chatId: 1, timestamp: -1 });
+messageSchema.index({ sender: 1, timestamp: -1 });
+messageSchema.index({ readBy: 1 });
 
 const User = mongoose.model('User', userSchema);
 const Chat = mongoose.model('Chat', chatSchema);
 const Message = mongoose.model('Message', messageSchema);
 
+// Add after MongoDB Schemas
+const chatRooms = new Map(); // Store active chat rooms
+
 // Enable CORS
-app.use(cors());
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
 
 // Rate limiting
@@ -122,6 +172,40 @@ const CONNECTION_CHECK_INTERVAL = 30000; // 30 seconds
 const BROADCAST_THROTTLE_MS = 5000; // 5 seconds
 const SYSTEM_MESSAGE_THROTTLE_MS = 15000; // 15 seconds
 const CLEANUP_INTERVAL = 60000; // 1 minute
+
+// Add typing status tracking
+const typingUsers = new Map(); // chatId -> Set of typing users
+const typingTimeouts = new Map(); // username_chatId -> timeout
+
+// Function to broadcast typing status
+function broadcastTypingStatus(chatId, username, isTyping) {
+  Chat.findById(chatId).then(chat => {
+    if (!chat) return;
+
+    const message = {
+      type: 'typing_status',
+      chatId,
+      username,
+      isTyping
+    };
+
+    // Broadcast to all participants except the sender
+    chat.participants.forEach(participant => {
+      if (participant !== username) {
+        const userConnections = Array.from(clients.entries())
+          .filter(([_, client]) => client.user?.username === participant);
+
+        userConnections.forEach(([ws]) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(message));
+          }
+        });
+      }
+    });
+  }).catch(error => {
+    console.error('Error broadcasting typing status:', error);
+  });
+}
 
 // Helper function to generate JWT tokens
 function generateTokens(user) {
@@ -498,23 +582,74 @@ wss.on('connection', (ws) => {
             return;
           }
 
-          // Extract chat ID and message content
-          const { chatId, content } = data;
-          
-          if (!chatId || !content) {
-            console.error('Missing chatId or content:', data);
-            ws.send(JSON.stringify({
-              type: 'error',
-              content: 'Missing chatId or message content'
-            }));
-            return;
-          }
-          
           try {
+            const { chatId, content, fileUrl, fileName, fileSize, fileType } = data;
+            
+            if (!chatId || !content) {
+              console.error('Missing chatId or content:', data);
+              ws.send(JSON.stringify({
+                type: 'error',
+                content: 'Missing chatId or message content'
+              }));
+              return;
+            }
+            
             // Check if user is part of this chat
-            const chat = await Chat.findById(chatId);
+            let chat = await Chat.findById(chatId);
+            
+            // If chat doesn't exist, create a new DM chat
             if (!chat) {
-              console.error('Chat not found:', chatId);
+              // Try to find existing DM chat with these participants
+              const otherUser = content.startsWith('@') ? content.split(' ')[0].substring(1) : null;
+              if (otherUser) {
+                chat = await Chat.findOne({
+                  type: 'direct',
+                  participants: { $all: [user.username, otherUser], $size: 2 }
+                });
+              }
+              
+              // If still no chat, create new one
+              if (!chat && otherUser) {
+                // Verify other user exists
+                const otherUserExists = await User.findOne({ username: otherUser });
+                if (!otherUserExists) {
+                  ws.send(JSON.stringify({
+                    type: 'error',
+                    content: 'User not found'
+                  }));
+                  return;
+                }
+                
+                chat = new Chat({
+                  type: 'direct',
+                  participants: [user.username, otherUser],
+                  name: `${user.username}_${otherUser}`,
+                  createdBy: user.username
+                });
+                
+                await chat.save();
+                
+                // Notify the other user about the new chat
+                const otherUserConnections = Array.from(clients.entries())
+                  .filter(([_, client]) => client.user?.username === otherUser);
+                
+                otherUserConnections.forEach(([clientWs]) => {
+                  if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({
+                      type: 'new_chat',
+                      chat: {
+                        ...chat.toObject(),
+                        _id: chat._id.toString(),
+                        lastMessage: null
+                      }
+                    }));
+                  }
+                });
+              }
+            }
+
+            if (!chat) {
+              console.error('Chat not found and could not be created');
               ws.send(JSON.stringify({
                 type: 'error',
                 content: 'Chat not found'
@@ -522,23 +657,33 @@ wss.on('connection', (ws) => {
               return;
             }
             
+            // Check if user is a participant or add them if it's a DM
             if (!chat.participants.includes(user.username)) {
-              console.error('User not in chat participants:', user.username, chat.participants);
-              ws.send(JSON.stringify({
-                type: 'error',
-                content: 'You are not a participant in this chat'
-              }));
-              return;
+              if (chat.type === 'direct') {
+                chat.participants.push(user.username);
+                await chat.save();
+              } else {
+                console.error('User not in chat participants:', user.username, chat.participants);
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  content: 'You are not a participant in this chat'
+                }));
+                return;
+              }
             }
             
             // Create and save the message
             const messageData = {
-              chatId,
-              type: 'message',
+              chatId: chat._id,
+              type: fileUrl ? 'file' : 'text',
               content,
               sender: user.username,
               timestamp: new Date(),
-              readBy: [user.username]
+              readBy: [user.username],
+              fileUrl,
+              fileName,
+              fileSize,
+              fileType
             };
 
             // Store message in MongoDB
@@ -554,48 +699,40 @@ wss.on('connection', (ws) => {
               // Format message for broadcasting with string IDs
               const broadcastMessage = {
                 type: 'chat_message',
-                chatId: ensureStringId(chat._id),
+                chatId: chat._id.toString(),
                 messageData: {
                   ...messageData,
-                  _id: ensureStringId(newMessage._id),
-                  chatId: ensureStringId(messageData.chatId),
+                  _id: newMessage._id.toString(),
+                  chatId: messageData.chatId.toString(),
                   timestamp: messageData.timestamp.toISOString()
                 }
               };
 
-              console.log('Broadcasting message to chat participants:', chat.participants);
-              
               // Track which users have received the message
               const messageReceivedBy = new Set();
               
-              // Broadcast to all participants of this chat who are online
+              // Broadcast to all participants
               chat.participants.forEach(participant => {
-                const participantSession = userSessions.get(participant);
-                if (participantSession) {
-                  // Find all WebSocket connections for this participant
-                  clients.forEach((clientInfo, clientWs) => {
-                    if (clientInfo.user && 
-                        clientInfo.user.username === participant && 
-                        clientWs.readyState === WebSocket.OPEN &&
-                        !messageReceivedBy.has(participant)) {
-                      
-                      clientWs.send(JSON.stringify(broadcastMessage));
-                      messageReceivedBy.add(participant);
-                      
-                      // If not the sender, also send a notification message
-                      if (participant !== user.username) {
-                        const notificationMessage = {
-                          type: 'notification',
-                          chatId: ensureStringId(chat._id),
-                          sender: user.username,
-                          content: content.substring(0, 50) + (content.length > 50 ? '...' : ''),
-                          timestamp: new Date().toISOString()
-                        };
-                        clientWs.send(JSON.stringify(notificationMessage));
-                      }
+                const participantConnections = Array.from(clients.entries())
+                  .filter(([_, client]) => client.user?.username === participant);
+                  
+                participantConnections.forEach(([clientWs]) => {
+                  if (clientWs.readyState === WebSocket.OPEN && !messageReceivedBy.has(participant)) {
+                    clientWs.send(JSON.stringify(broadcastMessage));
+                    messageReceivedBy.add(participant);
+                    
+                    // Send notification if not the sender
+                    if (participant !== user.username) {
+                      clientWs.send(JSON.stringify({
+                        type: 'notification',
+                        chatId: chat._id.toString(),
+                        sender: user.username,
+                        content: content.substring(0, 50) + (content.length > 50 ? '...' : ''),
+                        timestamp: new Date().toISOString()
+                      }));
                     }
-                  });
-                }
+                  }
+                });
               });
               
               console.log(`Message broadcast to ${messageReceivedBy.size} unique users`);
@@ -679,15 +816,32 @@ wss.on('connection', (ws) => {
             
             // Mark messages as read
             if (messages.length > 0) {
-              await Message.updateMany(
-                { 
-                  chatId,
-                  readBy: { $ne: user.username }
-                },
-                { 
-                  $addToSet: { readBy: user.username } 
+              for (const message of messages) {
+                if (!message.readBy.includes(user.username)) {
+                  await Message.updateOne(
+                    { _id: message._id },
+                    { $addToSet: { readBy: user.username } }
+                  );
+                  
+                  // Broadcast read status
+                  chat.participants.forEach(participant => {
+                    const participantConnections = Array.from(clients.entries())
+                      .filter(([_, client]) => client.user?.username === participant);
+                      
+                    participantConnections.forEach(([clientWs]) => {
+                      if (clientWs.readyState === WebSocket.OPEN) {
+                        clientWs.send(JSON.stringify({
+                          type: 'message_read',
+                          messageId: message._id.toString(),
+                          chatId: message.chatId.toString(),
+                          username: user.username,
+                          readBy: [...message.readBy, user.username]
+                        }));
+                      }
+                    });
+                  });
                 }
-              );
+              }
             }
           } catch (error) {
             console.error('Error joining chat:', error);
@@ -734,13 +888,32 @@ wss.on('connection', (ws) => {
                 return;
               }
               
-              // Check if chat already exists
+              // Check if chat already exists (including deleted ones)
               const existingChat = await Chat.findOne({
                 type: 'direct',
-                participants: { $all: [user.username, otherUser], $size: 2 }
+                $or: [
+                  { participants: { $all: [user.username, otherUser], $size: 2 } },
+                  { 
+                    name: { 
+                      $in: [
+                        `${user.username}_${otherUser}`,
+                        `${otherUser}_${user.username}`
+                      ]
+                    }
+                  }
+                ]
               });
               
               if (existingChat) {
+                // If chat exists but user was removed, add them back
+                if (!existingChat.participants.includes(user.username)) {
+                  existingChat.participants.push(user.username);
+                }
+                if (!existingChat.participants.includes(otherUser)) {
+                  existingChat.participants.push(otherUser);
+                }
+                existingChat.isActive = true;
+                await existingChat.save();
                 newChat = existingChat;
               } else {
                 // Create new direct chat
@@ -748,7 +921,8 @@ wss.on('connection', (ws) => {
                   type: 'direct',
                   name: `${user.username}_${otherUser}`,
                   participants: [user.username, otherUser],
-                  createdBy: user.username
+                  createdBy: user.username,
+                  isActive: true
                 });
                 
                 await newChat.save();
@@ -767,7 +941,8 @@ wss.on('connection', (ws) => {
                 type: 'group',
                 name,
                 participants: allParticipants,
-                createdBy: user.username
+                createdBy: user.username,
+                isActive: true
               });
               
               await newChat.save();
@@ -775,20 +950,20 @@ wss.on('connection', (ws) => {
               // Notify other participants about the new chat
               for (const participant of allParticipants) {
                 if (participant !== user.username) {
-                  const participantSession = userSessions.get(participant);
-                  if (participantSession) {
-                    clients.forEach((clientInfo, clientWs) => {
-                      if (clientInfo.user.username === participant && clientWs.readyState === WebSocket.OPEN) {
-                        clientWs.send(JSON.stringify({
-                          type: 'new_chat',
-                          chat: {
-                            ...newChat.toObject(),
-                            lastMessage: null
-                          }
-                        }));
-                      }
-                    });
-                  }
+                  const participantConnections = Array.from(clients.entries())
+                    .filter(([_, client]) => client.user?.username === participant);
+                    
+                  participantConnections.forEach(([clientWs]) => {
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                      clientWs.send(JSON.stringify({
+                        type: 'new_chat',
+                        chat: {
+                          ...newChat.toObject(),
+                          _id: newChat._id.toString()
+                        }
+                      }));
+                    }
+                  });
                 }
               }
             }
@@ -798,7 +973,7 @@ wss.on('connection', (ws) => {
               type: 'new_chat',
               chat: {
                 ...newChat.toObject(),
-                lastMessage: null
+                _id: newChat._id.toString()
               }
             }));
             
@@ -1003,6 +1178,232 @@ wss.on('connection', (ws) => {
             ws.send(JSON.stringify({
               type: 'error',
               content: 'Error deleting chat'
+            }));
+          }
+          break;
+
+        case 'typing_start':
+          if (!user || !data.chatId) break;
+          
+          const chatTypingUsers = typingUsers.get(data.chatId) || new Set();
+          chatTypingUsers.add(user.username);
+          typingUsers.set(data.chatId, chatTypingUsers);
+          
+          // Clear existing timeout if any
+          const timeoutKey = `${user.username}_${data.chatId}`;
+          if (typingTimeouts.has(timeoutKey)) {
+            clearTimeout(typingTimeouts.get(timeoutKey));
+          }
+          
+          // Set new timeout
+          typingTimeouts.set(timeoutKey, setTimeout(() => {
+            const users = typingUsers.get(data.chatId);
+            if (users) {
+              users.delete(user.username);
+              if (users.size === 0) {
+                typingUsers.delete(data.chatId);
+              }
+              broadcastTypingStatus(data.chatId, user.username, false);
+            }
+            typingTimeouts.delete(timeoutKey);
+          }, 3000));
+          
+          broadcastTypingStatus(data.chatId, user.username, true);
+          break;
+
+        case 'typing_stop':
+          if (!user || !data.chatId) break;
+          
+          const typingSet = typingUsers.get(data.chatId);
+          if (typingSet) {
+            typingSet.delete(user.username);
+            if (typingSet.size === 0) {
+              typingUsers.delete(data.chatId);
+            }
+          }
+          
+          const typingTimeoutKey = `${user.username}_${data.chatId}`;
+          if (typingTimeouts.has(typingTimeoutKey)) {
+            clearTimeout(typingTimeouts.get(typingTimeoutKey));
+            typingTimeouts.delete(typingTimeoutKey);
+          }
+          
+          broadcastTypingStatus(data.chatId, user.username, false);
+          break;
+
+        case 'message_read':
+          if (!user || !data.messageId) break;
+          
+          try {
+            const message = await Message.findById(data.messageId);
+            if (!message) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                content: 'Message not found'
+              }));
+              break;
+            }
+            
+            // Add user to readBy array if not already there
+            if (!message.readBy.includes(user.username)) {
+              message.readBy.push(user.username);
+              await message.save();
+              
+              // Broadcast read status to all participants
+              const chat = await Chat.findById(message.chatId);
+              if (chat) {
+                chat.participants.forEach(participant => {
+                  const participantConnections = Array.from(clients.entries())
+                    .filter(([_, client]) => client.user?.username === participant);
+                    
+                  participantConnections.forEach(([clientWs]) => {
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                      clientWs.send(JSON.stringify({
+                        type: 'message_read',
+                        messageId: message._id.toString(),
+                        chatId: message.chatId.toString(),
+                        username: user.username,
+                        readBy: message.readBy
+                      }));
+                    }
+                  });
+                });
+              }
+            }
+          } catch (error) {
+            console.error('Error marking message as read:', error);
+            ws.send(JSON.stringify({
+              type: 'error',
+              content: 'Failed to mark message as read'
+            }));
+          }
+          break;
+
+        case 'edit_message':
+          if (!user || !data.messageId || !data.content) break;
+          
+          try {
+            const message = await Message.findById(data.messageId);
+            if (!message || message.sender !== user.username) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                content: 'Cannot edit this message'
+              }));
+              break;
+            }
+
+            // Check if message is within 20-minute edit window
+            const messageTime = new Date(message.timestamp).getTime();
+            const currentTime = new Date().getTime();
+            const timeDiff = currentTime - messageTime;
+            const EDIT_WINDOW = 20 * 60 * 1000; // 20 minutes in milliseconds
+
+            if (timeDiff > EDIT_WINDOW) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                content: 'Messages can only be edited within 20 minutes of sending'
+              }));
+              break;
+            }
+            
+            // Add current content to edit history
+            message.editHistory.push({
+              content: message.content,
+              editedAt: new Date()
+            });
+            
+            // Update message
+            message.content = data.content;
+            message.isEdited = true;
+            message.editedAt = new Date();
+            await message.save();
+            
+            // Get the chat to broadcast to all participants
+            const chat = await Chat.findById(message.chatId);
+            if (chat) {
+              // Broadcast edit to all chat participants
+              const editedMessage = {
+                type: 'message_edited',
+                messageId: message._id.toString(),
+                chatId: message.chatId.toString(),
+                content: message.content,
+                editedAt: message.editedAt.toISOString(),
+                editHistory: message.editHistory,
+                sender: message.sender,
+                timestamp: message.timestamp,
+                isEdited: true
+              };
+              
+              chat.participants.forEach(participant => {
+                const participantConnections = Array.from(clients.entries())
+                  .filter(([_, client]) => client.user?.username === participant);
+                  
+                participantConnections.forEach(([clientWs]) => {
+                  if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify(editedMessage));
+                  }
+                });
+              });
+            }
+          } catch (error) {
+            console.error('Error editing message:', error);
+            ws.send(JSON.stringify({
+              type: 'error',
+              content: 'Failed to edit message'
+            }));
+          }
+          break;
+
+        case 'delete_message':
+          if (!user || !data.messageId) break;
+          
+          try {
+            const message = await Message.findById(data.messageId);
+            if (!message || message.sender !== user.username) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                content: 'Cannot delete this message'
+              }));
+              break;
+            }
+            
+            // Instead of just adding to deletedFor, we'll mark the message as deleted
+            message.type = 'deleted';
+            message.content = 'This message has been deleted';
+            message.isDeleted = true;
+            message.deletedAt = new Date();
+            await message.save();
+            
+            // Get the chat to broadcast to all participants
+            const chat = await Chat.findById(message.chatId);
+            if (chat) {
+              const deletedMessage = {
+                type: 'message_deleted',
+                messageId: message._id.toString(),
+                chatId: message.chatId.toString(),
+                content: message.content,
+                deletedAt: message.deletedAt.toISOString(),
+                sender: message.sender,
+                timestamp: message.timestamp,
+                isDeleted: true
+              };
+              
+              chat.participants.forEach(participant => {
+                const participantConnections = Array.from(clients.entries())
+                  .filter(([_, client]) => client.user?.username === participant);
+                  
+                participantConnections.forEach(([clientWs]) => {
+                  if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify(deletedMessage));
+                  }
+                });
+              });
+            }
+          } catch (error) {
+            console.error('Error deleting message:', error);
+            ws.send(JSON.stringify({
+              type: 'error',
+              content: 'Failed to delete message'
             }));
           }
           break;
@@ -1832,4 +2233,64 @@ function gracefulShutdown() {
     console.error('Forced shutdown after timeout');
     process.exit(1);
   }, 5000);
-} 
+}
+
+// Update file upload endpoint
+app.post('/api/upload', (req, res, next) => {
+  // Ensure proper error handling for multer
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      console.error('Multer error:', err);
+      return res.status(400).json({ 
+        error: err.message || 'File upload failed',
+        details: err
+      });
+    }
+    next();
+  });
+}, async (req, res) => {
+  try {
+    console.log('File upload request received');
+    
+    if (!req.file) {
+      console.error('No file received in request');
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('File upload successful:', {
+      path: req.file.path,
+      filename: req.file.originalname,
+      size: req.file.size,
+      mimetype: req.file.mimetype
+    });
+
+    // Check file size (10MB limit)
+    if (req.file.size > 10 * 1024 * 1024) {
+      console.error('File size too large:', req.file.size);
+      return res.status(400).json({ error: 'File size must be less than 10MB' });
+    }
+
+    // Check file type
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+    if (!allowedTypes.includes(req.file.mimetype)) {
+      console.error('Invalid file type:', req.file.mimetype);
+      return res.status(400).json({ error: 'Invalid file type. Only images, PDFs, and Word documents are allowed.' });
+    }
+
+    // Set proper content type
+    res.setHeader('Content-Type', 'application/json');
+    
+    res.json({
+      fileUrl: req.file.path,
+      fileName: req.file.originalname,
+      fileSize: req.file.size,
+      fileType: req.file.mimetype
+    });
+  } catch (error) {
+    console.error('File upload error:', error);
+    res.status(500).json({ 
+      error: 'File upload failed',
+      details: error.message 
+    });
+  }
+}); 
