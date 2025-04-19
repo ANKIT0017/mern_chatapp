@@ -53,8 +53,10 @@ import {
   Link,
   Icon
 } from '@chakra-ui/react';
+import { keyframes } from '@emotion/react';
 import { AddIcon, SettingsIcon, BellIcon, EditIcon, DeleteIcon, AttachmentIcon, CheckIcon } from '@chakra-ui/icons';
 import AuthForm from './components/AuthForm';
+import UserProfile from './components/UserProfile';
 import { FaPaperPlane } from 'react-icons/fa';
 import { FiPaperclip, FiEdit2, FiTrash2, FiCheck } from 'react-icons/fi';
 
@@ -82,6 +84,7 @@ const App = () => {
   const [editText, setEditText] = useState('');
   const [typingUsers, setTypingUsers] = useState({});
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [profileUser, setProfileUser] = useState(null); // Added for user profile viewing
 
   // Move all refs to the top
   const ws = useRef(null);
@@ -112,6 +115,13 @@ const App = () => {
     onClose: onNewChatClose 
   } = useDisclosure();
   
+  // Profile modal state
+  const {
+    isOpen: isProfileOpen,
+    onOpen: onProfileOpen,
+    onClose: onProfileClose
+  } = useDisclosure();
+  
   // Form states for creating chats
   const [selectedUser, setSelectedUser] = useState('');
   const [groupName, setGroupName] = useState('');
@@ -119,14 +129,14 @@ const App = () => {
 
   // WebSocket connection management
   const [wsStatus, setWsStatus] = useState('disconnected');
-  const MAX_RECONNECT_ATTEMPTS = 1000; // Increased to allow for more reconnection attempts
-  const RECONNECT_DELAY = 2000; // Reduced initial delay to 2 seconds
+  const MAX_RECONNECT_ATTEMPTS = 20; // Reduced max reconnect attempts to avoid excessive reconnection
+  const RECONNECT_DELAY = 5000; // Initial delay of 5 seconds
   const MAX_SYSTEM_MESSAGES = 2;
-  const PING_INTERVAL = 15000; // Reduced to 15 seconds for more frequent health checks
-  const CONNECTION_TIMEOUT = 10000; // Reduced to 10 seconds
+  const PING_INTERVAL = 60000; // Increase to 60 seconds to reduce network traffic
+  const CONNECTION_TIMEOUT = 20000; // Increase to 20 seconds for slower connections
 
   // Add rate limiting for token refresh
-  const MIN_REFRESH_INTERVAL = 10000; // Minimum 10 seconds between refreshes
+  const MIN_REFRESH_INTERVAL = 60000; // Increase to 60 seconds to reduce token refresh frequency
 
   // You can use this if you have a notification sound file
   // const [playNotificationSound] = useSound(notificationSound);
@@ -142,6 +152,14 @@ const App = () => {
   useEffect(() => {
     setMessage('');
   }, [activeChat]);
+
+  // Add effect to reset online users when user changes
+  useEffect(() => {
+    // If user is null (logged out), clear online users
+    if (!user) {
+      setOnlineUsers([]);
+    }
+  }, [user]);
 
   // Basic utility functions first
   const showNotification = useCallback((sender, message, chatId) => {
@@ -188,6 +206,19 @@ const App = () => {
       if (data.chatId && data.messages && Array.isArray(data.messages)) {
         const validMessages = data.messages.filter(msg => msg.sender && typeof msg.sender === 'string');
         
+        // Log file messages for debugging
+        validMessages.forEach(msg => {
+          if (msg.type === 'file') {
+            console.log('Received file message:', {
+              id: msg._id,
+              content: msg.content,
+              fileUrl: msg.fileUrl,
+              fileName: msg.fileName,
+              fileType: msg.fileType
+            });
+          }
+        });
+        
         setChatMessages(prev => ({
           ...prev,
           [data.chatId]: validMessages
@@ -198,6 +229,17 @@ const App = () => {
         }, 100);
       }
       return;
+    }
+
+    // If it's a file message, log it
+    if (data.messageData && data.messageData.type === 'file') {
+      console.log('Received new file message:', {
+        id: data.messageData._id,
+        content: data.messageData.content,
+        fileUrl: data.messageData.fileUrl,
+        fileName: data.messageData.fileName,
+        fileType: data.messageData.fileType
+      });
     }
 
     // Handle edited messages
@@ -238,69 +280,111 @@ const App = () => {
         });
       });
     }
-
-    // Handle new messages
-    if (data.messageData) {
-      if (!data.messageData.sender || typeof data.messageData.sender !== 'string') {
-        console.error('Invalid message sender:', data.messageData);
-        return;
-      }
-
-      // Update messages in the chat
+    
+    // Handle deleted messages
+    if (data.type === 'message_deleted') {
+      console.log('Message deleted received in handleChatMessage:', data);
+      
       setChatMessages(prev => {
         const chatMessages = prev[data.chatId] || [];
-        
-        const isDuplicate = chatMessages.some(msg => 
-          (msg._id && msg._id === data.messageData._id) || 
-          (msg.sender === data.messageData.sender && 
-           msg.timestamp === data.messageData.timestamp && 
-           msg.content === data.messageData.content)
-        );
-        
-        if (isDuplicate) return prev;
-
         return {
           ...prev,
-          [data.chatId]: [...chatMessages, data.messageData]
+          [data.chatId]: chatMessages.map(msg => 
+            msg._id === data.messageId
+              ? {
+                  ...msg,
+                  content: 'This message has been deleted',
+                  type: 'deleted',
+                  isDeleted: true,
+                  deletedAt: data.deletedAt
+                }
+              : msg
+          )
         };
       });
 
-      // Update the chats list to show the latest message
+      // Update chat list if it was the last message
       setChats(prevChats => {
-        const updatedChats = prevChats.map(chat => {
-          if (chat._id === data.chatId) {
+        return prevChats.map(chat => {
+          if (chat._id === data.chatId && chat.lastMessage?._id === data.messageId) {
             return {
               ...chat,
-              lastMessage: data.messageData,
-              lastActivity: new Date().toISOString()
+              lastMessage: {
+                ...chat.lastMessage,
+                content: 'This message has been deleted',
+                type: 'deleted',
+                isDeleted: true,
+                deletedAt: data.deletedAt
+              }
             };
           }
           return chat;
         });
-
-        // Sort chats by last activity
-        return updatedChats.sort((a, b) => {
-          const timeA = a.lastActivity || a.createdAt;
-          const timeB = b.lastActivity || b.createdAt;
-          return new Date(timeB) - new Date(timeA);
-        });
       });
-
-      // Handle unread counts and notifications
-      if (data.chatId !== activeChat && data.messageData.sender !== user.username) {
-        setUnreadCounts(prev => ({
-          ...prev,
-          [data.chatId]: (prev[data.chatId] || 0) + 1
-        }));
-        
-        showNotification(
-          data.messageData.sender,
-          data.messageData.content,
-          data.chatId
-        );
-      }
       
-      if (data.chatId === activeChat) {
+      return; // Return after handling deletion
+    }
+
+    // Handle new messages
+    if (data.type === 'chat_message') {
+      if (data.messageData) {
+        // Log message data for debugging
+        console.log('Received message data:', data.messageData);
+        
+        // Add message to chat messages
+        setChatMessages(prev => {
+          const chatMessages = prev[data.chatId] || [];
+          
+          // Check for duplicate message
+          const isDuplicate = chatMessages.some(msg => msg._id === data.messageData._id);
+          if (isDuplicate) {
+            return prev;
+          }
+          
+          return {
+            ...prev,
+            [data.chatId]: [...chatMessages, data.messageData]
+          };
+        });
+        
+        // Update chat list
+        setChats(prevChats => {
+          const updatedChats = prevChats.map(chat => {
+            if (chat._id === data.chatId) {
+              return {
+                ...chat,
+                lastMessage: data.messageData,
+                lastActivity: new Date().toISOString()
+              };
+            }
+            return chat;
+          });
+          return updatedChats;
+        });
+        
+        // Handle notifications for messages not from the current user
+        if (data.messageData.sender !== user.username) {
+          // Show notification if not in the active chat
+          if (data.chatId !== activeChat || document.hidden) {
+            showNotification(
+              data.messageData.sender, 
+              data.messageData.type === 'file' 
+                ? `[File] ${data.messageData.content}`
+                : data.messageData.content,
+              data.chatId
+            );
+            
+            // Increment unread count if it's not the active chat
+            if (data.chatId !== activeChat) {
+              setUnreadCounts(prev => ({
+                ...prev,
+                [data.chatId]: (prev[data.chatId] || 0) + 1
+              }));
+            }
+          }
+        }
+        
+        // Scroll to bottom after message is added
         setTimeout(() => {
           messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
         }, 100);
@@ -453,12 +537,12 @@ const App = () => {
     if (user && accessToken) {
       // Set up automatic token refresh
       const refreshInterval = setInterval(async () => {
-        // Refresh token 1 minute before it expires (assuming 15 min expiry)
+        // Refresh token 5 minutes before it expires (assuming 15 min expiry)
         const success = await refreshAccessToken();
         if (!success) {
           console.error('Failed to refresh token');
         }
-      }, 14 * 60 * 1000); // 14 minutes
+      }, 10 * 60 * 1000); // 10 minutes (reduced frequency)
 
       return () => clearInterval(refreshInterval);
     }
@@ -467,29 +551,79 @@ const App = () => {
   // Update handleLogout to ensure proper cleanup
   const handleLogout = useCallback(async () => {
     console.log('Handling logout for user:', user?.username);
+    
+    // First, stop all reconnection attempts and intervals
+    if (reconnectTimeout.current) {
+      clearTimeout(reconnectTimeout.current);
+      reconnectTimeout.current = null;
+    }
+    
+    if (keepaliveInterval.current) {
+      clearInterval(keepaliveInterval.current);
+      keepaliveInterval.current = null;
+    }
+    
+    if (connectionTimeout.current) {
+      clearTimeout(connectionTimeout.current);
+      connectionTimeout.current = null;
+    }
+    
+    // Reset reconnection attempts
+    reconnectAttempts.current = 0;
+    
     try {
+      // Send logout message through WebSocket first if connected
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        ws.current.send(JSON.stringify({
-          type: 'logout',
-          token: accessToken
-        }));
+        try {
+          // Send the logout message and wait a moment to ensure it's processed
+          ws.current.send(JSON.stringify({
+            type: 'logout',
+            token: accessToken
+          }));
+          
+          // Give server a moment to process the logout message
+          await new Promise(resolve => setTimeout(resolve, 500));
+        } catch (e) {
+          console.error('Error sending WebSocket logout:', e);
+        }
       }
 
-      // Call logout endpoint
-      await fetch('http://localhost:5000/api/logout', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${accessToken}`
-        },
-        body: JSON.stringify({ refreshToken })
-      });
+      // Close WebSocket connection properly
+      if (ws.current) {
+        try {
+          ws.current.onclose = null; // Remove close handler to prevent reconnection attempts
+          ws.current.close(1000, "User logout");
+        } catch (e) {
+          console.error('Error closing WebSocket during logout:', e);
+        }
+        ws.current = null;
+      }
 
-      // Clear all stored tokens and user data
-      localStorage.clear(); // Clear all stored data
+      // Only call logout endpoint if we have tokens (avoid unnecessary requests)
+      if (accessToken && refreshToken) {
+        try {
+          const response = await fetch('http://localhost:5000/api/logout', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${accessToken}`
+            },
+            body: JSON.stringify({ refreshToken })
+          });
+          
+          if (!response.ok && response.status !== 429) {
+            console.warn(`Logout API response: ${response.status}`);
+          }
+        } catch (error) {
+          console.error('Logout API error:', error);
+        }
+      }
     } catch (error) {
       console.error('Logout error:', error);
     } finally {
+      // Clear all stored tokens and user data
+      localStorage.clear(); // Clear all stored data
+      
       // Reset all state
       setAccessToken(null);
       setRefreshToken(null);
@@ -497,19 +631,10 @@ const App = () => {
       setChats([]);
       setChatMessages({});
       setActiveChat(null);
-      setOnlineUsers([]);
+      setOnlineUsers([]); // Clear online users immediately on the client side
       setNotifications([]);
       
-      // Close WebSocket connection
-      if (ws.current) {
-        ws.current.close();
-        ws.current = null;
-      }
-
-      // Reset all refs
-      reconnectAttempts.current = 0;
-      lastTokenRefresh.current = 0;
-      isRefreshingToken.current = false;
+      setWsStatus('disconnected');
     }
   }, [accessToken, refreshToken, user]);
 
@@ -552,31 +677,84 @@ const App = () => {
 
   // Connection management functions
   const handleReconnect = useCallback((forceBackoff = false) => {
+    // Don't attempt to reconnect if we're already in the process of reconnecting
     if (reconnectTimeout.current) {
-      clearTimeout(reconnectTimeout.current);
-      reconnectTimeout.current = null;
+      console.log("Reconnection already in progress, not scheduling another");
+      return;
+    }
+    
+    // Don't attempt reconnection if we're refreshing a token
+    if (isRefreshingToken.current) {
+      console.log("Token refresh in progress, delaying reconnection");
+      reconnectTimeout.current = setTimeout(() => {
+        reconnectTimeout.current = null;
+        if (handleReconnectRef.current) {
+          handleReconnectRef.current(forceBackoff);
+        }
+      }, 5000); // Wait 5 seconds and try again
+      return;
     }
     
     reconnectAttempts.current += 1;
     
-    // Calculate delay with exponential backoff
+    // Calculate delay with exponential backoff but with a more gradual increase
+    // and a higher maximum delay for stability
     let delay = RECONNECT_DELAY;
     if (forceBackoff || reconnectAttempts.current > 2) {
-      delay = Math.min(30000, RECONNECT_DELAY * Math.pow(1.5, Math.min(reconnectAttempts.current - 1, 10)));
+      // More gradual exponential backoff with longer waits between attempts
+      // 5s, 15s, 30s, 60s, 120s, 300s (5 min max)
+      delay = Math.min(300000, Math.pow(2, Math.min(reconnectAttempts.current, 6)) * RECONNECT_DELAY);
     }
     
     console.log(`Scheduling reconnection attempt ${reconnectAttempts.current} in ${delay}ms`);
     setWsStatus('reconnecting');
     
-    reconnectTimeout.current = setTimeout(() => {
-      if (user && accessToken) {
-        console.log(`Attempting reconnection ${reconnectAttempts.current}`);
-        if (connectWebSocketRef.current) {
-          connectWebSocketRef.current();
+    // Check if we need to refresh the token before reconnection
+    const tokenRefreshNeeded = accessToken && !isRefreshingToken.current && 
+      (Date.now() - lastTokenRefresh.current > 5 * 60 * 1000); // If token is older than 5 minutes
+    
+    // Only attempt to reconnect if we haven't exceeded the maximum attempts
+    // or if we're within a reasonable time window of the last successful connection
+    const shouldAttemptReconnect = 
+      reconnectAttempts.current <= MAX_RECONNECT_ATTEMPTS ||
+      (lastSuccessfulConnection.current && (Date.now() - lastSuccessfulConnection.current < 3600000)); // 1 hour
+    
+    if (shouldAttemptReconnect) {
+      reconnectTimeout.current = setTimeout(async () => {
+        if (user && accessToken) {
+          console.log(`Attempting reconnection ${reconnectAttempts.current}`);
+          
+          // Try to refresh token if needed but not too frequently
+          if (tokenRefreshNeeded) {
+            try {
+              console.log('Refreshing token before reconnection attempt');
+              const success = await refreshAccessToken();
+              if (!success) {
+                console.log('Token refresh failed, continuing with reconnection anyway');
+              }
+            } catch (e) {
+              console.error('Error refreshing token before reconnection:', e);
+            }
+          }
+          
+          if (connectWebSocketRef.current) {
+            reconnectTimeout.current = null; // Clear reference before attempting new connection
+            connectWebSocketRef.current();
+          }
+        } else {
+          reconnectTimeout.current = null;
+          setWsStatus('disconnected');
         }
-      }
-    }, delay);
-  }, [user, accessToken]);
+      }, delay);
+    } else {
+      console.log('Exceeded maximum reconnection attempts or reconnection window');
+      setWsStatus('disconnected');
+      // Reset attempt count after a long delay to allow future reconnection attempts
+      setTimeout(() => {
+        reconnectAttempts.current = 0;
+      }, 600000); // Reset after 10 minutes
+    }
+  }, [user, accessToken, MAX_RECONNECT_ATTEMPTS, RECONNECT_DELAY, refreshAccessToken]);
 
   // WebSocket connection function
   const connectWebSocket = useCallback(() => {
@@ -588,6 +766,12 @@ const App = () => {
     // Don't try to connect if we're refreshing the token
     if (isRefreshingToken.current) {
       console.log('Token refresh in progress, delaying connection');
+      return;
+    }
+
+    // Prevent duplicate connection attempts
+    if (ws.current && (ws.current.readyState === WebSocket.CONNECTING || ws.current.readyState === WebSocket.OPEN)) {
+      console.log('WebSocket already connected or connecting, skipping connection attempt');
       return;
     }
 
@@ -625,265 +809,31 @@ const App = () => {
     const uniqueId = Date.now() + Math.random().toString(36).substr(2, 9);
     const reconnectCount = reconnectAttempts.current;
     const timestamp = Date.now();
-    const socketUrl = `ws://localhost:5000?id=${uniqueId}&reconnect=${reconnectCount}&t=${timestamp}`;
+    
+    // Get the current host for WebSocket connections
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = process.env.REACT_APP_API_HOST || window.location.hostname;
+    const port = process.env.REACT_APP_API_PORT || '5000';
+    const socketUrl = `${protocol}//${host}:${port}?id=${uniqueId}&reconnect=${reconnectCount}&t=${timestamp}`;
+    
+    console.log(`Connecting to WebSocket at ${socketUrl}`);
     
     try {
-      // Close any existing connection first
+      // Only close existing connection if actually open
       if (ws.current) {
-        console.log('Closing existing WebSocket connection before creating a new one.');
-        try {
-          ws.current.close(1000, "Replaced by new connection");
-        } catch (e) {
-          console.error('Error closing previous connection:', e);
-        }
-      }
-      
-      // Create new WebSocket connection
-      ws.current = new WebSocket(socketUrl);
-      ws.current.binaryType = 'arraybuffer';
-      setWsStatus('connecting');
-      connectionStartTime.current = Date.now();
-      lastActivity.current = Date.now();
-      
-      // Handle connection opening
-      ws.current.onopen = () => {
-        const connectTime = Date.now() - connectionStartTime.current;
-        console.log(`WebSocket connected in ${connectTime}ms`);
-        setWsStatus('connected');
-        reconnectAttempts.current = 0;
-        successfulConnections.current++;
-        lastSuccessfulConnection.current = Date.now();
-        
-        if (connectionTimeout.current) {
-          clearTimeout(connectionTimeout.current);
-          connectionTimeout.current = null;
-        }
-        
-        // Send login message immediately after connection
-        if (accessToken) {
-          console.log('WebSocket connected, sending login message');
+        if (ws.current.readyState === WebSocket.OPEN || ws.current.readyState === WebSocket.CONNECTING) {
+          console.log('Closing existing WebSocket connection before creating a new one.');
           try {
-            ws.current.send(JSON.stringify({
-              type: 'login',
-              token: accessToken,
-              clientInfo: {
-                userAgent: navigator.userAgent,
-                timestamp: Date.now(),
-                connectionId: uniqueId,
-                reconnectCount: reconnectCount,
-                connectionTime: connectTime
-              }
-            }));
+            ws.current.close(1000, "Replaced by new connection");
           } catch (e) {
-            console.error('Error sending login message:', e);
-            if (handleReconnectRef.current) {
-              handleReconnectRef.current();
-            }
-            return;
+            console.error('Error closing previous connection:', e);
           }
         }
-        
-        // Setup keepalive interval
-        if (keepaliveInterval.current) {
-          clearInterval(keepaliveInterval.current);
-        }
-        
-        keepaliveInterval.current = setInterval(() => {
-          if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-            const now = Date.now();
-            try {
-              ws.current.send(JSON.stringify({ 
-                type: 'ping', 
-                timestamp: now,
-                connectionId: uniqueId
-              }));
-              lastActivity.current = now;
-            } catch (e) {
-              console.error('Error sending ping:', e);
-              if (handleReconnectRef.current) {
-                handleReconnectRef.current();
-              }
-            }
-          }
-        }, PING_INTERVAL);
-      };
-
-      // Update WebSocket message handler
-      ws.current.onmessage = async (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          lastActivity.current = Date.now();
-
-          if (data.type === 'error' && (data.message === 'Invalid or expired token' || data.content === 'Invalid or expired token')) {
-            // Only attempt refresh if we haven't tried too recently
-            if (Date.now() - lastTokenRefresh.current >= MIN_REFRESH_INTERVAL) {
-              console.log('Token expired, attempting to refresh...');
-              const success = await refreshAccessToken();
-              if (!success) {
-                console.log('Token refresh failed, logging out...');
-                if (logoutRef.current) {
-                  logoutRef.current();
-                }
-              }
-            } else {
-              console.log('Token refresh attempted too recently, waiting...');
-            }
-            return;
-          }
-
-          switch (data.type) {
-            case 'users':
-              setAvailableUsers(data.users);
-              break;
-            case 'chat_members':
-              setChatMembers(data.members);
-              break;
-            case 'chat_cleared':
-              setChatMessages(prev => ({
-                ...prev,
-                [data.chatId]: []
-              }));
-              break;
-            case 'chat_deleted':
-              setChats(prev => prev.filter(chat => chat._id !== data.chatId));
-              if (activeChat === data.chatId) {
-                setActiveChat(null);
-              }
-              break;
-            case 'onlineUsers':
-              // Filter out any duplicate users and the current user
-              const uniqueUsers = Array.from(new Set(data.users || []));
-              // Remove the current user from the online users list since they're shown separately
-              const otherOnlineUsers = uniqueUsers.filter(u => u !== user?.username);
-              setOnlineUsers(otherOnlineUsers);
-              break;
-            case 'ping':
-              if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                ws.current.send(JSON.stringify({ 
-                  type: 'pong', 
-                  timestamp: Date.now(),
-                  received: data.timestamp,
-                  latency: data.timestamp ? Date.now() - data.timestamp : null,
-                  connectionId: uniqueId
-                }));
-              }
-              break;
-            case 'pong':
-              if (data.received) {
-                const latency = Date.now() - data.received;
-                if (latency > 1000) {
-                  console.warn(`High WebSocket latency: ${latency}ms`);
-                }
-              }
-              break;
-            case 'hello':
-              console.log('Connected to server');
-              break;
-            case 'chats':
-              if (data.chats && Array.isArray(data.chats)) {
-                setChats(data.chats);
-              }
-              break;
-            case 'chat_history':
-              handleChatMessage({
-                type: 'chat_history',
-                chatId: data.chatId,
-                messages: data.messages
-              });
-              break;
-            case 'chat_message':
-              handleChatMessage(data);
-              break;
-            case 'message':
-              handleChatMessage({
-                type: 'chat_message',
-                chatId: data.chatId,
-                messageData: data
-              });
-              break;
-            case 'system':
-              handleSystemMessage(data);
-              break;
-            case 'typing_status':
-              setTypingUsers(prev => {
-                const newTypingUsers = { ...prev };
-                if (data.chatId && data.username && data.username !== user?.username) {
-                  if (!newTypingUsers[data.chatId]) {
-                    newTypingUsers[data.chatId] = new Set();
-                  }
-                  
-                  if (data.isTyping) {
-                    newTypingUsers[data.chatId].add(data.username);
-                  } else {
-                    newTypingUsers[data.chatId].delete(data.username);
-                    if (newTypingUsers[data.chatId].size === 0) {
-                      delete newTypingUsers[data.chatId];
-                    }
-                  }
-                }
-                return newTypingUsers;
-              });
-              break;
-            case 'message_edited':
-              handleChatMessage(data);
-              break;
-            case 'message_deleted':
-              handleChatMessage(data);
-              break;
-            case 'message_read':
-              setChatMessages(prev => {
-                const chatMessages = prev[data.chatId] || [];
-                return {
-                  ...prev,
-                  [data.chatId]: chatMessages.map(msg => 
-                    msg._id === data.messageId 
-                      ? { 
-                          ...msg, 
-                          readBy: [...new Set([...msg.readBy, data.username])]
-                        }
-                      : msg
-                  )
-                };
-              });
-              break;
-            default:
-              console.log('Unknown message type:', data.type);
-          }
-        } catch (error) {
-          console.error('Error processing WebSocket message:', error);
-        }
-      };
-      
-      // Handle connection closing
-      ws.current.onclose = (event) => {
-        console.log(`WebSocket connection closed. Code: ${event.code} Reason: ${event.reason || 'No reason provided'}`);
-        setWsStatus('disconnected');
-        
-        if (keepaliveInterval.current) {
-          clearInterval(keepaliveInterval.current);
-          keepaliveInterval.current = null;
-        }
-        
-        // Only attempt to reconnect if not a normal closure and user is still logged in
-        if (event.code !== 1000 && event.code !== 1001 && user) {
-          if (document.visibilityState === 'visible') {
-            console.log('Abnormal closure, attempting to reconnect...');
-            if (handleReconnectRef.current) {
-              handleReconnectRef.current(false);
-            }
-          }
-        }
-      };
-      
-      // Handle connection errors
-      ws.current.onerror = (error) => {
-        console.error('WebSocket error occurred:', error);
-        setWsStatus('error');
-        
-        // Don't try to immediately reconnect on error
-        // The onclose handler will be called and will handle reconnection
-      };
-      
+        // Wait a moment before creating a new connection
+        setTimeout(() => createNewConnection(), 500);
+      } else {
+        createNewConnection();
+      }
     } catch (error) {
       console.error('Error establishing WebSocket connection:', error);
       setWsStatus('error');
@@ -891,7 +841,391 @@ const App = () => {
         handleReconnectRef.current(true);
       }
     }
-  }, [accessToken, user, refreshAccessToken]);
+    
+    function createNewConnection() {
+      try {
+        // Create new WebSocket connection
+        ws.current = new WebSocket(socketUrl);
+        ws.current.binaryType = 'arraybuffer';
+        setWsStatus('connecting');
+        connectionStartTime.current = Date.now();
+        lastActivity.current = Date.now();
+        
+        // Handle connection opening
+        ws.current.onopen = () => {
+          const connectTime = Date.now() - connectionStartTime.current;
+          console.log(`WebSocket connected in ${connectTime}ms`);
+          setWsStatus('connected');
+          reconnectAttempts.current = 0;
+          successfulConnections.current++;
+          lastSuccessfulConnection.current = Date.now();
+          
+          if (connectionTimeout.current) {
+            clearTimeout(connectionTimeout.current);
+            connectionTimeout.current = null;
+          }
+          
+          // Send login message immediately after connection
+          if (accessToken) {
+            console.log('WebSocket connected, sending login message');
+            try {
+              ws.current.send(JSON.stringify({
+                type: 'login',
+                token: accessToken,
+                clientInfo: {
+                  userAgent: navigator.userAgent,
+                  timestamp: Date.now(),
+                  connectionId: uniqueId,
+                  reconnectCount: reconnectCount,
+                  connectionTime: connectTime
+                }
+              }));
+            } catch (e) {
+              console.error('Error sending login message:', e);
+              if (handleReconnectRef.current) {
+                handleReconnectRef.current();
+              }
+              return;
+            }
+          }
+          
+          // Setup keepalive interval
+          if (keepaliveInterval.current) {
+            clearInterval(keepaliveInterval.current);
+          }
+          
+          keepaliveInterval.current = setInterval(() => {
+            if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+              const now = Date.now();
+              try {
+                ws.current.send(JSON.stringify({ 
+                  type: 'ping', 
+                  timestamp: now,
+                  connectionId: uniqueId
+                }));
+                lastActivity.current = now;
+              } catch (e) {
+                console.error('Error sending ping:', e);
+                if (handleReconnectRef.current) {
+                  handleReconnectRef.current();
+                }
+              }
+            }
+          }, PING_INTERVAL);
+        };
+  
+        // Other handlers remain the same...
+        // (update: ws.current.onmessage, ws.current.onclose, ws.current.onerror)
+        
+        // WebSocket message handler
+        ws.current.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            lastActivity.current = Date.now();
+    
+            if (data.type === 'error' && (data.message === 'Invalid or expired token' || data.content === 'Invalid or expired token')) {
+              // Only attempt refresh if we haven't tried too recently
+              if (Date.now() - lastTokenRefresh.current >= MIN_REFRESH_INTERVAL) {
+                console.log('Token expired, attempting to refresh...');
+                const success = await refreshAccessToken();
+                if (!success) {
+                  console.log('Token refresh failed, logging out...');
+                  if (logoutRef.current) {
+                    logoutRef.current();
+                  }
+                }
+              } else {
+                console.log('Token refresh attempted too recently, waiting...');
+              }
+              return;
+            }
+    
+            switch (data.type) {
+              case 'users':
+                setAvailableUsers(data.users);
+                break;
+              case 'chat_members':
+                setChatMembers(data.members);
+                break;
+              case 'chat_cleared':
+                setChatMessages(prev => ({
+                  ...prev,
+                  [data.chatId]: []
+                }));
+                break;
+              case 'chat_deleted':
+                setChats(prev => prev.filter(chat => chat._id !== data.chatId));
+                if (activeChat === data.chatId) {
+                  setActiveChat(null);
+                }
+                break;
+              case 'onlineUsers':
+                // Filter out any duplicate users and the current user
+                const uniqueUsers = Array.from(new Set(data.users || []));
+                // If we're logged out, don't show any online users
+                // Otherwise remove the current user from the list
+                const otherOnlineUsers = user 
+                  ? uniqueUsers.filter(u => u !== user.username)
+                  : []; // If logged out, don't show anyone as online
+                
+                console.log('Received online users:', uniqueUsers, 'filtered to:', otherOnlineUsers);
+                setOnlineUsers(otherOnlineUsers);
+                break;
+              case 'ping':
+                if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+                  ws.current.send(JSON.stringify({ 
+                    type: 'pong', 
+                    timestamp: Date.now(),
+                    received: data.timestamp,
+                    latency: data.timestamp ? Date.now() - data.timestamp : null,
+                    connectionId: uniqueId
+                  }));
+                }
+                break;
+              case 'pong':
+                if (data.received) {
+                  const latency = Date.now() - data.received;
+                  if (latency > 1000) {
+                    console.warn(`High WebSocket latency: ${latency}ms`);
+                  }
+                }
+                break;
+              case 'hello':
+                console.log('Connected to server');
+                break;
+              case 'chats':
+                if (data.chats && Array.isArray(data.chats)) {
+                  setChats(data.chats);
+                }
+                break;
+              case 'chat_history':
+                handleChatMessage({
+                  type: 'chat_history',
+                  chatId: data.chatId,
+                  messages: data.messages
+                });
+                break;
+              case 'chat_message':
+                handleChatMessage(data);
+                break;
+              case 'message':
+                handleChatMessage({
+                  type: 'chat_message',
+                  chatId: data.chatId,
+                  messageData: data
+                });
+                break;
+              case 'new_chat':
+                console.log('New chat received:', data.chat);
+                // Add the new chat to the chat list while handling duplicates
+                setChats(prevChats => {
+                  // Check if this exact chat already exists
+                  const chatExists = prevChats.some(chat => chat._id === data.chat._id);
+                  if (chatExists) {
+                    return prevChats;
+                  }
+                  
+                  // Identify any temporary chat that might be for the same conversation
+                  // For direct chats, check if both have the same participants
+                  const hasSameParticipants = (chat1, chat2) => {
+                    if (chat1.type !== chat2.type) return false;
+                    if (chat1.type === 'direct' && chat2.type === 'direct') {
+                      const chat1Participants = new Set(chat1.participants);
+                      const chat2Participants = new Set(chat2.participants);
+                      
+                      // Check if both sets have the same participants
+                      return chat1Participants.size === chat2Participants.size && 
+                             [...chat1Participants].every(p => chat2Participants.has(p));
+                    }
+                    
+                    // For group chats, check if they have the same name
+                    if (chat1.type === 'group' && chat2.type === 'group') {
+                      return chat1.name === chat2.name;
+                    }
+                    
+                    return false;
+                  };
+                  
+                  // First remove any temporary chat with same participants
+                  const isTemp = id => typeof id === 'string' && id.startsWith('temp-');
+                  const duplicateIndex = prevChats.findIndex(chat => 
+                    isTemp(chat._id) && hasSameParticipants(chat, data.chat)
+                  );
+                  
+                  // If a duplicate temporary chat is found, replace it with the real one
+                  if (duplicateIndex >= 0) {
+                    const tempChatId = prevChats[duplicateIndex]._id;
+                    console.log(`Replacing temporary chat ${tempChatId} with real chat ${data.chat._id}`);
+                    
+                    // Update active chat if it was the temporary one
+                    if (activeChat === tempChatId) {
+                      // We'll need to update activeChat outside this function
+                      setTimeout(() => setActiveChat(data.chat._id), 0);
+                    }
+                    
+                    // Replace the temporary chat with the real one
+                    const updatedChats = [...prevChats];
+                    updatedChats[duplicateIndex] = data.chat;
+                    return updatedChats;
+                  }
+                  
+                  // Otherwise add as new chat at the beginning
+                  return [data.chat, ...prevChats];
+                });
+                break;
+              case 'chat_updated':
+                console.log('Chat updated received:', data.chat);
+                // Update the chat in the chat list
+                setChats(prevChats => {
+                  // Check if chat exists in the list
+                  const chatIndex = prevChats.findIndex(chat => chat._id === data.chat._id);
+                  
+                  // If chat exists, update it; otherwise, add it to the list
+                  if (chatIndex >= 0) {
+                    const updatedChats = [...prevChats];
+                    updatedChats[chatIndex] = data.chat;
+                    return updatedChats;
+                  } else {
+                    // Add new chat to the beginning of the list
+                    return [data.chat, ...prevChats];
+                  }
+                });
+                break;
+              case 'system':
+                handleSystemMessage(data);
+                break;
+              case 'typing_status':
+                setTypingUsers(prev => {
+                  const newTypingUsers = { ...prev };
+                  if (data.chatId && data.username && data.username !== user?.username) {
+                    if (!newTypingUsers[data.chatId]) {
+                      newTypingUsers[data.chatId] = new Set();
+                    }
+                    
+                    if (data.isTyping) {
+                      newTypingUsers[data.chatId].add(data.username);
+                    } else {
+                      newTypingUsers[data.chatId].delete(data.username);
+                      if (newTypingUsers[data.chatId].size === 0) {
+                        delete newTypingUsers[data.chatId];
+                      }
+                    }
+                  }
+                  return newTypingUsers;
+                });
+                break;
+              case 'message_edited':
+                handleChatMessage(data);
+                break;
+              case 'message_deleted':
+                // Don't call handleChatMessage, our direct event handler will handle it
+                console.log('message_deleted event received in switch, dispatching direct event');
+                break;
+              case 'message_read':
+                setChatMessages(prev => {
+                  const chatMessages = prev[data.chatId] || [];
+                  return {
+                    ...prev,
+                    [data.chatId]: chatMessages.map(msg => 
+                      msg._id === data.messageId 
+                        ? { 
+                            ...msg, 
+                            readBy: [...new Set([...msg.readBy, data.username])]
+                          }
+                        : msg
+                    )
+                  };
+                });
+                break;
+              case 'temp_chat_replaced':
+                // Handle replacement of temporary chat IDs with real server IDs
+                console.log(`Replacing temporary chat ID ${data.tempId} with real ID ${data.realChatId}`);
+                
+                // Update active chat if it's the one being replaced
+                if (activeChat === data.tempId) {
+                  setActiveChat(data.realChatId);
+                }
+                
+                // Update the chats list
+                setChats(prevChats => {
+                  return prevChats.map(chat => 
+                    chat._id === data.tempId 
+                      ? { ...chat, _id: data.realChatId }
+                      : chat
+                  );
+                });
+                
+                // Move any messages from the temporary chat ID to the real one
+                setChatMessages(prev => {
+                  const tempMessages = prev[data.tempId] || [];
+                  if (tempMessages.length === 0) return prev;
+                  
+                  // Create new object without the temp chat entry but with messages moved to real ID
+                  const newMessages = { ...prev };
+                  delete newMessages[data.tempId];
+                  
+                  // Update the chat ID in each message
+                  newMessages[data.realChatId] = tempMessages.map(msg => ({
+                    ...msg,
+                    chatId: data.realChatId
+                  }));
+                  
+                  return newMessages;
+                });
+                break;
+              default:
+                console.log('Unknown message type:', data.type);
+            }
+          } catch (error) {
+            console.error('Error processing WebSocket message:', error);
+          }
+        };
+        
+        // Handle connection closing
+        ws.current.onclose = (event) => {
+          console.log(`WebSocket connection closed. Code: ${event.code} Reason: ${event.reason || 'No reason provided'}`);
+          setWsStatus('disconnected');
+          
+          if (keepaliveInterval.current) {
+            clearInterval(keepaliveInterval.current);
+            keepaliveInterval.current = null;
+          }
+          
+          // Check if this was a normal closure or if we need to reconnect
+          const isNormalClosure = event.code === 1000 || event.code === 1001;
+          const isUserLoggedIn = !!user;
+          const isPageVisible = document.visibilityState === 'visible';
+          
+          // Only attempt to reconnect under specific conditions
+          if (!isNormalClosure && isUserLoggedIn && isPageVisible && event.reason !== "Replaced by new connection") {
+            console.log('Abnormal closure, attempting to reconnect...');
+            // Use a slightly longer delay for onclose reconnection
+            setTimeout(() => {
+              if (handleReconnectRef.current) {
+                handleReconnectRef.current(false);
+              }
+            }, 2000); // 2-second delay before reconnection
+          } else {
+            console.log(`Not reconnecting: normal=${isNormalClosure}, loggedIn=${isUserLoggedIn}, visible=${isPageVisible}, reason=${event.reason}`);
+          }
+        };
+        
+        // Handle connection errors
+        ws.current.onerror = (error) => {
+          console.error('WebSocket error occurred:', error);
+          setWsStatus('error');
+          
+          // The onclose handler will be called after this and handle reconnection
+        };
+      } catch (error) {
+        console.error('Error creating new WebSocket:', error);
+        setWsStatus('error');
+        if (handleReconnectRef.current) {
+          handleReconnectRef.current(true);
+        }
+      }
+    }
+  }, [accessToken, user, refreshAccessToken, CONNECTION_TIMEOUT, PING_INTERVAL, MIN_REFRESH_INTERVAL, activeChat, handleSystemMessage, handleChatMessage]);
 
   // Update refs
   useEffect(() => {
@@ -940,23 +1274,30 @@ const App = () => {
         const now = Date.now();
         const inactivityTime = now - lastActivity.current;
         
+        // Only attempt to reconnect if there's been no activity for twice the ping interval
+        // and the connection is not already in the process of connecting
         if (ws.current.readyState === WebSocket.OPEN && inactivityTime > PING_INTERVAL * 2) {
           console.log(`No activity for ${inactivityTime}ms, checking connection...`);
           try {
+            // Send a ping to check if connection is still alive
             ws.current.send(JSON.stringify({ type: 'ping', timestamp: now }));
+            // Update last activity time to prevent multiple pings
+            lastActivity.current = now;
           } catch (error) {
             console.error('Error sending ping, connection may be dead:', error);
             if (handleReconnectRef.current) {
               handleReconnectRef.current(true);
             }
           }
-        } else if (ws.current.readyState !== WebSocket.OPEN && ws.current.readyState !== WebSocket.CONNECTING) {
-          console.log('Connection is closed or closing, attempting to reconnect...');
+        } else if (ws.current.readyState === WebSocket.CLOSED && wsStatus !== 'reconnecting') {
+          // Only reconnect if we're not already in the process of reconnecting
+          console.log('Connection is closed, attempting to reconnect...');
           if (handleReconnectRef.current) {
             handleReconnectRef.current(false);
           }
         }
-      } else if (user) {
+        // Don't attempt to reconnect if already connecting
+      } else if (user && wsStatus !== 'connecting' && wsStatus !== 'reconnecting') {
         console.log('No WebSocket instance found, creating new connection...');
         if (connectWebSocketRef.current) {
           connectWebSocketRef.current();
@@ -967,7 +1308,7 @@ const App = () => {
     const intervalId = setInterval(checkConnection, PING_INTERVAL);
     
     return () => clearInterval(intervalId);
-  }, [user]);
+  }, [user, wsStatus, PING_INTERVAL, handleReconnectRef, connectWebSocketRef]);
 
   // Update the cleanup effect
   useEffect(() => {
@@ -1024,35 +1365,35 @@ const App = () => {
     }
   }, []);
 
-  const sendMessage = useCallback(() => {
-    if (!message.trim() || !activeChat || !ws.current || ws.current.readyState !== WebSocket.OPEN || !user) {
+  // Add a helper for sending messages
+  const sendMessage = useCallback((content, chatId) => {
+    if (!content.trim() || !chatId || !ws.current || ws.current.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    const messageContent = message.trim();
-    setMessage('');
-
-    const messageData = {
+    // Include originalChatId if it's a temporary ID to help server associate with real chat
+    const isTemporaryChat = chatId.startsWith('temp-');
+    
+    ws.current.send(JSON.stringify({
       type: 'chat_message',
-      chatId: activeChat,
-      content: messageContent,
-      token: accessToken // Add token for server-side validation
-    };
+      chatId: chatId,
+      content: content,
+      ...(isTemporaryChat && { originalChatId: chatId })
+    }));
 
-    try {
-      ws.current.send(JSON.stringify(messageData));
-    } catch (error) {
-      console.error('Error sending message:', error);
-      toast({
-        title: "Error",
-        description: "Failed to send message. Please try again.",
-        status: "error",
-        duration: 3000,
-        isClosable: true,
-      });
-      setMessage(messageContent);
+    setMessage('');
+    
+    // Stop typing indicator
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = null;
     }
-  }, [message, activeChat, ws, toast, user, accessToken]);
+    
+    ws.current.send(JSON.stringify({
+      type: 'typing_stop',
+      chatId: chatId
+    }));
+  }, []);
 
   const handleCreateGroupChat = useCallback(() => {
     if (!groupName || selectedGroupMembers.length === 0) {
@@ -1074,19 +1415,24 @@ const App = () => {
         participants: selectedGroupMembers
       }));
       
-      // Add optimistic update
+      // Add optimistic update with structure matching server response
+      const tempId = `temp-${Date.now()}`;
+      const allParticipants = [...selectedGroupMembers, user.username];
       const newGroupChat = {
-        _id: `temp-${Date.now()}`,
+        _id: tempId,
         type: 'group',
         name: groupName,
-        participants: [...selectedGroupMembers, user.username],
+        participants: allParticipants,
+        otherParticipants: selectedGroupMembers, // Add otherParticipants array
         createdBy: user.username,
         lastMessage: null,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        lastActivity: new Date().toISOString(),
+        unreadCount: 0 // Add unreadCount property
       };
       
       setChats(prevChats => [newGroupChat, ...prevChats]);
-      setActiveChat(newGroupChat._id);
+      setActiveChat(tempId);
       
       onNewChatClose();
       setGroupName('');
@@ -1113,20 +1459,23 @@ const App = () => {
         participants: [selectedUser]
       }));
       
-      // Add optimistic update
+      // Add optimistic update with structure matching server response
+      const tempId = `temp-${Date.now()}`;
       const newDirectChat = {
-        _id: `temp-${Date.now()}`,
+        _id: tempId,
         type: 'direct',
         name: `${user.username}_${selectedUser}`,
         participants: [user.username, selectedUser],
         otherParticipants: [selectedUser],
         createdBy: user.username,
         lastMessage: null,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        lastActivity: new Date().toISOString(),
+        unreadCount: 0
       };
       
       setChats(prevChats => [newDirectChat, ...prevChats]);
-      setActiveChat(newDirectChat._id);
+      setActiveChat(tempId);
       
       onNewChatClose();
       setSelectedUser('');
@@ -1195,6 +1544,9 @@ const App = () => {
                   name={chatName} 
                   bg={chat.type === 'group' ? "purple.500" : "blue.500"}
                   size="md"
+                  src={chat.type === 'direct' 
+                    ? availableUsers.find(u => u.username === chatName)?.avatar 
+                    : chat.avatar} 
                 />
                 {isOnline && (
                   <Box
@@ -1231,7 +1583,8 @@ const App = () => {
                     mt={1}
                     width="100%"
                   >
-                    {chat.type === 'group' ? (
+                    {/* Only show sender name in group chats, not in DMs */}
+                    {chat.type === 'group' && !chat.lastMessage.isDeleted ? (
                       <>
                         <Text as="span" fontWeight="medium" color="gray.700">
                           {chat.lastMessage.sender}:
@@ -1240,6 +1593,16 @@ const App = () => {
                       </>
                     ) : null}
                     {chat.lastMessage.content}
+                    {chat.lastMessage.isDeleted && (
+                      <Badge 
+                        colorScheme="red" 
+                        variant="outline"
+                        fontSize="2xs"
+                        ml={1}
+                      >
+                        deleted
+                      </Badge>
+                    )}
                   </Text>
                 )}
                 {!chat.lastMessage && (
@@ -1256,7 +1619,7 @@ const App = () => {
               {unreadCount > 0 && (
                 <Flex
                   borderRadius="full"
-                  bg="blue.500"
+                  bg="green.500"
                   color="white"
                   px={2}
                   py={1}
@@ -1266,6 +1629,9 @@ const App = () => {
                   justifyContent="center"
                   fontSize="xs"
                   fontWeight="bold"
+                  boxShadow="0px 1px 3px rgba(0, 0, 0, 0.2)"
+                  ml={1}
+                  transform="translateY(-2px)"
                 >
                   {unreadCount}
                 </Flex>
@@ -1334,13 +1700,19 @@ const App = () => {
     const handleKeyDown = useCallback((e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        sendMessage();
+        if (message.trim() && activeChat) {
+          sendMessage(message, activeChat);
+        }
       }
-    }, [sendMessage]);
+    }, [sendMessage, message, activeChat]);
 
-    const handleSendClick = useCallback(() => {
-      sendMessage();
-    }, [sendMessage]);
+    const handleSendClick = () => {
+      if (!message.trim()) return;
+      
+      if (activeChat) {
+        sendMessage(message, activeChat);
+      }
+    };
 
     // Focus input on mount and when active chat changes
     useEffect(() => {
@@ -1385,9 +1757,27 @@ const App = () => {
             <Avatar 
               name={chatName} 
               bg={isOnline ? "green.500" : "gray.400"}
+              cursor={chat.type === 'direct' ? "pointer" : "default"}
+              onClick={() => {
+                if (chat.type === 'direct') {
+                  openUserProfile(chatName);
+                }
+              }}
+              // Add src prop to display user avatar
+              src={chat.type === 'direct' ? availableUsers.find(u => u.username === chatName)?.avatar : chat.avatar}
             />
             <VStack spacing={0} align="start">
-              <Text fontWeight="bold">{chatName}</Text>
+              <Text 
+                fontWeight="bold"
+                cursor={chat.type === 'direct' ? "pointer" : "default"}
+                onClick={() => {
+                  if (chat.type === 'direct') {
+                    openUserProfile(chatName);
+                  }
+                }}
+              >
+                {chatName}
+              </Text>
               <Text fontSize="sm" color="gray.500">
                 {isOnline ? 'Online' : chat.type === 'group' ? `${chat.participants.length} members` : 'Offline'}
               </Text>
@@ -1745,6 +2135,15 @@ const App = () => {
                   <Badge colorScheme={member.isOnline ? "green" : "gray"}>
                     {member.isOnline ? "Online" : "Offline"}
                   </Badge>
+                  <Button 
+                    size="sm" 
+                    onClick={() => {
+                      setViewMembersOpen(false);
+                      openUserProfile(member.username);
+                    }}
+                  >
+                    View Profile
+                  </Button>
                 </Flex>
               ))}
             </VStack>
@@ -1880,23 +2279,11 @@ const App = () => {
         setUploadProgress(100);
         setTimeout(() => setUploadProgress(0), 1000);
         
-        toast({
-          title: 'Success',
-          description: 'File uploaded successfully',
-          status: 'success',
-          duration: 3000,
-          isClosable: true
-        });
+        // Removed success toast for file upload
       }
     } catch (error) {
       console.error('File upload error:', error);
-      toast({
-        title: 'Upload Failed',
-        description: error.message || 'Failed to upload file. Please try again.',
-        status: 'error',
-        duration: 5000,
-        isClosable: true
-      });
+      // Only log the error, but don't show a toast notification
       setUploadProgress(0);
     }
   }, [activeChat, accessToken, toast]);
@@ -1908,6 +2295,7 @@ const App = () => {
     const handleWebSocketMessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        console.log('WebSocket message received:', data);
         
         if (data.type === 'message_edited') {
           // Update chat messages
@@ -1949,7 +2337,9 @@ const App = () => {
         }
         
         if (data.type === 'message_deleted') {
-          // Remove message from chat messages
+          console.log('Message deleted event received directly:', data);
+          
+          // Update message in chat messages to show as deleted
           setChatMessages(prev => {
             const chatMessages = prev[data.chatId] || [];
             return {
@@ -1959,6 +2349,7 @@ const App = () => {
                   ? {
                       ...msg,
                       content: 'This message has been deleted',
+                      type: 'deleted',
                       isDeleted: true,
                       deletedAt: data.deletedAt
                     }
@@ -1976,6 +2367,7 @@ const App = () => {
                   lastMessage: {
                     ...chat.lastMessage,
                     content: 'This message has been deleted',
+                    type: 'deleted',
                     isDeleted: true,
                     deletedAt: data.deletedAt
                   }
@@ -1984,6 +2376,8 @@ const App = () => {
               return chat;
             })
           );
+          
+          // Removed toast notification for message deletion
         }
       } catch (error) {
         console.error('Error handling WebSocket message:', error);
@@ -1992,7 +2386,7 @@ const App = () => {
 
     ws.current.addEventListener('message', handleWebSocketMessage);
     return () => ws.current?.removeEventListener('message', handleWebSocketMessage);
-  }, [ws]);
+  }, [ws, toast, chats]);
 
   // Update Message component with better edit and delete handling
   const Message = ({ message, isOwnMessage }) => {
@@ -2095,6 +2489,10 @@ const App = () => {
       return `edited ${editedTime}`;
     };
 
+    // Get the current chat type to know if this is a DM or group
+    const currentChat = chats.find(c => c._id === activeChat);
+    const isDirect = currentChat?.type === 'direct';
+    
     return (
       <Box
         ref={messageRef}
@@ -2115,11 +2513,62 @@ const App = () => {
           shadow="sm"
           opacity={message.isDeleted ? 0.7 : 1}
         >
-          {!isOwnMessage && (
-            <Text fontSize="sm" fontWeight="medium" mb={1} color={isOwnMessage ? "blue.100" : "gray.600"}>
-              {message.sender}
-            </Text>
-          )}
+          {/* Only show profile info in group chats, not in DMs */}
+          {!isOwnMessage && !isDirect ? (
+            <HStack mb={1}>
+              <Avatar 
+                size="xs" 
+                name={message.sender} 
+                cursor="pointer" 
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openUserProfile(message.sender);
+                }}
+                // Look for the user avatar in available users (if loaded)
+                src={availableUsers.find(u => u.username === message.sender)?.avatar}
+              />
+              <Text 
+                fontSize="sm" 
+                fontWeight="medium" 
+                color={isOwnMessage ? "blue.100" : "gray.600"}
+                cursor="pointer"
+                _hover={{ textDecoration: "underline" }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openUserProfile(message.sender);
+                }}
+              >
+                {message.sender}
+              </Text>
+            </HStack>
+          ) : isOwnMessage && !isDirect ? (
+            <HStack mb={1} justify="flex-end">
+              <Text 
+                fontSize="sm" 
+                fontWeight="medium" 
+                color="blue.100"
+                cursor="pointer"
+                _hover={{ textDecoration: "underline" }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openUserProfile(message.sender);
+                }}
+              >
+                {message.sender}
+              </Text>
+              <Avatar 
+                size="xs" 
+                name={message.sender} 
+                cursor="pointer" 
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openUserProfile(message.sender);
+                }}
+                // Use user's avatar for own messages
+                src={user?.avatar}
+              />
+            </HStack>
+          ) : null}
           
           {isEditing ? (
             <Textarea
@@ -2141,19 +2590,43 @@ const App = () => {
           ) : (
             <VStack align="start" spacing={1} width="100%">
               <HStack spacing={2} width="100%" align="center">
-                <Text 
-                  whiteSpace="pre-wrap" 
-                  wordBreak="break-word"
-                  fontStyle={message.isDeleted ? "italic" : "normal"}
-                  color={message.isDeleted ? (isOwnMessage ? "whiteAlpha.800" : "gray.500") : "inherit"}
-                >
-                  {message.content}
-                </Text>
+                {message.type === 'file' ? (
+                  <HStack spacing={2}>
+                    <AttachmentIcon />
+                    {message.fileUrl ? (
+                      <Link 
+                        href={message.fileUrl} 
+                        isExternal 
+                        color={isOwnMessage ? "white" : "blue.500"}
+                        textDecoration="underline"
+                        _hover={{ color: isOwnMessage ? "blue.100" : "blue.700" }}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {message.content || message.fileName || "Attachment"}
+                      </Link>
+                    ) : (
+                      <Text color={isOwnMessage ? "whiteAlpha.800" : "gray.500"}>
+                        {message.content || message.fileName || "Attachment"} (URL unavailable)
+                      </Text>
+                    )}
+                  </HStack>
+                ) : (
+                  <Text 
+                    whiteSpace="pre-wrap" 
+                    wordBreak="break-word"
+                    fontStyle={message.isDeleted ? "italic" : "normal"}
+                    color={message.isDeleted ? (isOwnMessage ? "whiteAlpha.800" : "gray.500") : "inherit"}
+                  >
+                    {message.content}
+                  </Text>
+                )}
                 {message.isDeleted && (
                   <Badge 
                     colorScheme="red" 
-                    variant="subtle"
+                    variant="solid"
                     fontSize="xs"
+                    ml={1}
                   >
                     deleted
                   </Badge>
@@ -2271,7 +2744,17 @@ const App = () => {
 
   // Use this component in your render to show notifications
   const NotificationsMenu = () => {
-    const notificationsRef = useRef(null);
+    const totalNotifications = notifications.length;
+    
+    // Create a pulse animation using Chakra's keyframes
+    const pulseAnimation = keyframes`
+      0% { transform: scale(1); }
+      50% { transform: scale(1.2); }
+      100% { transform: scale(1); }
+    `;
+    
+    const pulseAnimationStyle = totalNotifications > 0 ? 
+      `${pulseAnimation} 2s ease-in-out infinite` : '';
     
     return (
       <Menu>
@@ -2280,25 +2763,34 @@ const App = () => {
           aria-label="Notifications"
           icon={
             <Box position="relative">
-              <BellIcon />
-              {notifications.length > 0 && (
-                <Badge 
-                  colorScheme="red" 
-                  position="absolute" 
-                  top="-8px" 
-                  right="-8px"
+              <BellIcon boxSize={5} />
+              {totalNotifications > 0 && (
+                <Flex
+                  position="absolute"
+                  top="-2px"
+                  right="-2px"
                   borderRadius="full"
+                  bg="green.500"
+                  color="white"
+                  w="18px"
+                  h="18px"
                   fontSize="xs"
+                  alignItems="center"
+                  justifyContent="center"
+                  fontWeight="bold"
+                  boxShadow="0px 1px 2px rgba(0, 0, 0, 0.3)"
+                  border="2px solid white"
+                  animation={pulseAnimationStyle}
                 >
-                  {notifications.length}
-                </Badge>
+                  {totalNotifications}
+                </Flex>
               )}
             </Box>
           }
           variant="ghost"
           color="white"
         />
-        <MenuList zIndex={1000} maxH="400px" overflowY="auto" ref={notificationsRef}>
+        <MenuList zIndex={1000} maxH="400px" overflowY="auto">
           <MenuItem isDisabled fontWeight="bold">Notifications</MenuItem>
           <MenuItem onClick={() => setNotifications([])} color="blue.500">
             Clear all
@@ -2319,7 +2811,14 @@ const App = () => {
               >
                 <VStack align="start" spacing={1} w="100%">
                   <HStack w="100%" justify="space-between">
-                    <Text fontWeight="bold">{notification.sender}</Text>
+                    <HStack>
+                      <Avatar 
+                        size="xs" 
+                        name={notification.sender}
+                        src={availableUsers.find(u => u.username === notification.sender)?.avatar}
+                      />
+                      <Text fontWeight="bold">{notification.sender}</Text>
+                    </HStack>
                     <Text fontSize="xs" color="gray.500">
                       {new Date(notification.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
                     </Text>
@@ -2331,6 +2830,34 @@ const App = () => {
           )}
         </MenuList>
       </Menu>
+    );
+  };
+
+  // Add a function to open a user's profile
+  const openUserProfile = (username) => {
+    setProfileUser(username);
+    onProfileOpen();
+  };
+
+  // User Profile Modal
+  const UserProfileModal = () => {
+    return (
+      <Modal isOpen={isProfileOpen} onClose={onProfileClose} size="xl">
+        <ModalOverlay />
+        <ModalContent maxW="800px">
+          <ModalCloseButton />
+          <ModalBody p={0}>
+            {profileUser && (
+              <UserProfile 
+                username={profileUser} 
+                accessToken={accessToken} 
+                isCurrentUser={profileUser === user?.username}
+                onClose={onProfileClose}
+              />
+            )}
+          </ModalBody>
+        </ModalContent>
+      </Modal>
     );
   };
 
@@ -2363,8 +2890,31 @@ const App = () => {
             <Heading size="md">Chat App</Heading>
             <ConnectionStatus />
           </HStack>
-          <HStack>
+          <HStack spacing={4}>
             <NotificationsMenu />
+            
+            {/* Total unread messages badge */}
+            {user && (
+              <Tooltip label="Total unread messages" hasArrow>
+                <Badge 
+                  colorScheme="green" 
+                  borderRadius="full" 
+                  p={2} 
+                  display="flex"
+                  alignItems="center"
+                  fontSize="sm"
+                  fontWeight="bold"
+                  boxShadow="0px 1px 3px rgba(0, 0, 0, 0.2)"
+                  border="2px solid white"
+                >
+                  <HStack spacing={2}>
+                    <Text>{Object.values(unreadCounts).reduce((sum, count) => sum + count, 0)}</Text>
+                    <Icon as={BellIcon} />
+                  </HStack>
+                </Badge>
+              </Tooltip>
+            )}
+            
             <Tooltip label={`Online Users: ${onlineUsers.length > 0 ? onlineUsers.join(', ') : 'No other users online'}`} hasArrow>
               <Badge 
                 colorScheme="green" 
@@ -2380,51 +2930,66 @@ const App = () => {
                       <Avatar 
                         key={username} 
                         name={username} 
-                        size="xs" 
+                        size="xs"
+                        src={availableUsers.find(u => u.username === username)?.avatar}
                       />
                     ))}
                   </AvatarGroup>
                 </HStack>
               </Badge>
             </Tooltip>
-            <Menu>
-              <Tooltip label={`Logged in as ${user?.username}`} hasArrow placement="bottom">
-                <MenuButton
-                  as={Avatar}
-                  size="sm"
-                  name={user?.username}
-                  cursor="pointer"
-                  _hover={{ transform: 'scale(1.1)', transition: 'transform 0.2s' }}
-                />
-              </Tooltip>
-              <MenuList color="black">
-                <MenuItem closeOnSelect={false}>
-                  <VStack align="start" spacing={1} width="100%">
-                    <HStack width="100%" justify="space-between">
-                      <Avatar name={user?.username} size="md" />
-                      <VStack align="start" spacing={0}>
-                        <Text fontWeight="bold">{user?.username}</Text>
-                        <Text fontSize="sm" color="gray.500">Online</Text>
-                      </VStack>
-                    </HStack>
-                  </VStack>
-                </MenuItem>
-                <MenuDivider />
-                <MenuItem 
-                  icon={<SettingsIcon />}
-                  command="⌘S"
-                >
-                  Settings
-                </MenuItem>
-                <MenuItem 
-                  onClick={handleLogout}
-                  color="red.500"
-                  icon={<Box as="span" fontSize="1.1em">🚪</Box>}
-                >
-                  Logout
-                </MenuItem>
-              </MenuList>
-            </Menu>
+            
+            {/* User profile menu */}
+            {user && (
+              <Menu>
+                <Tooltip label={`Logged in as ${user?.username}`} hasArrow placement="bottom">
+                  <MenuButton
+                    as={Avatar}
+                    size="sm"
+                    name={user?.username}
+                    cursor="pointer"
+                    src={user?.avatar}
+                    _hover={{ transform: 'scale(1.1)', transition: 'transform 0.2s' }}
+                  />
+                </Tooltip>
+                <MenuList color="black">
+                  <MenuItem closeOnSelect={false}>
+                    <VStack align="start" spacing={1} width="100%">
+                      <HStack width="100%" justify="space-between">
+                        <Avatar 
+                          name={user?.username} 
+                          size="md" 
+                          cursor="pointer"
+                          src={user?.avatar}
+                          onClick={() => {
+                            openUserProfile(user?.username);
+                          }}
+                        />
+                        <VStack align="start" spacing={0}>
+                          <Text fontWeight="bold">{user?.username}</Text>
+                          <Text fontSize="sm" color="gray.500">Online</Text>
+                        </VStack>
+                      </HStack>
+                    </VStack>
+                  </MenuItem>
+                  <MenuDivider />
+                  <MenuItem 
+                    icon={<SettingsIcon />}
+                    command="⌘S"
+                    onClick={() => openUserProfile(user?.username)}
+                  >
+                    Profile Settings
+                  </MenuItem>
+                  <MenuItem 
+                    onClick={handleLogout}
+                    color="red.500"
+                    icon={<Box as="span" fontSize="1.1em">🚪</Box>}
+                  >
+                    Logout
+                  </MenuItem>
+                </MenuList>
+              </Menu>
+            )}
           </HStack>
         </Flex>
         
@@ -2469,6 +3034,7 @@ const App = () => {
         {/* Drawers and Modals */}
         <NewChatDrawer />
         <ViewMembersDrawer />
+        <UserProfileModal />
       </Box>
     </ChakraProvider>
   );

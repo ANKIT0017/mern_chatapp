@@ -29,7 +29,27 @@ const storage = new CloudinaryStorage({
   params: {
     folder: 'chat_attachments',
     allowed_formats: ['jpg', 'jpeg', 'png', 'gif', 'pdf', 'doc', 'docx'],
-    resource_type: 'auto'
+    resource_type: 'auto',
+    transformation: [{ width: 1000, height: 1000, crop: 'limit' }],
+    format: 'auto',
+    use_filename: true
+  }
+});
+
+// Configure special avatar storage for profile pictures
+const avatarStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'user_avatars',
+    allowed_formats: ['jpg', 'jpeg', 'png', 'gif'],
+    resource_type: 'image',
+    transformation: [
+      { width: 400, height: 400, crop: 'fill', gravity: 'face' },
+      { quality: 'auto' }
+    ],
+    format: 'webp',
+    use_filename: true,
+    public_id: (req, file) => `avatar_${req.params.username}_${Date.now()}`
   }
 });
 
@@ -37,6 +57,13 @@ const upload = multer({
   storage: storage,
   limits: {
     fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
+
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit for avatars
   }
 });
 
@@ -54,7 +81,11 @@ const userSchema = new mongoose.Schema({
   isAdmin: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
   avatar: { type: String, default: null },
-  contacts: [{ type: String }] // List of usernames in contacts
+  contacts: [{ type: String }], // List of usernames in contacts
+  bio: { type: String, default: "" },
+  email: { type: String, default: "" },
+  displayName: { type: String, default: null },
+  lastSeen: { type: Date, default: Date.now }
 });
 
 const chatSchema = new mongoose.Schema({
@@ -119,7 +150,7 @@ app.use(express.json());
 // Rate limiting
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // 50 requests per windowMs for auth endpoints
+  max: 100, // Increased from 50 to 100 requests per windowMs for auth endpoints
   message: { error: 'Too many authentication attempts, please try again later' },
   standardHeaders: true,
   legacyHeaders: false,
@@ -248,23 +279,20 @@ function broadcastOnlineUsers() {
   
   // Broadcast to ALL clients (including those not logged in)
   console.log(`Broadcasting online users to ${clients.size} clients`);
-  const sentUsers = new Set(); // Track who we've sent to already
+  let broadcastCount = 0;
   
   clients.forEach((clientInfo, client) => {
     if (client.readyState === WebSocket.OPEN) {
       try {
-        // Only send one notification per unique username
-        const username = clientInfo.user?.username || 'anonymous';
-        if (!sentUsers.has(username)) {
-          client.send(JSON.stringify(message));
-          sentUsers.add(username);
-          console.log(`Sent online users to ${username}`);
-        }
+        client.send(JSON.stringify(message));
+        broadcastCount++;
       } catch (error) {
         console.error(`Error sending online users to ${clientInfo.user?.username || 'anonymous'}:`, error);
       }
     }
   });
+  
+  console.log(`Successfully sent online users list to ${broadcastCount} clients`);
 }
 
 // This is a throttle helper to prevent excessive broadcasts
@@ -602,49 +630,77 @@ wss.on('connection', (ws) => {
               // Try to find existing DM chat with these participants
               const otherUser = content.startsWith('@') ? content.split(' ')[0].substring(1) : null;
               if (otherUser) {
+                // First try to find by participants (most reliable method)
                 chat = await Chat.findOne({
                   type: 'direct',
                   participants: { $all: [user.username, otherUser], $size: 2 }
                 });
-              }
-              
-              // If still no chat, create new one
-              if (!chat && otherUser) {
-                // Verify other user exists
-                const otherUserExists = await User.findOne({ username: otherUser });
-                if (!otherUserExists) {
-                  ws.send(JSON.stringify({
-                    type: 'error',
-                    content: 'User not found'
-                  }));
-                  return;
+                
+                // If not found, try by possible name variations
+                if (!chat) {
+                  chat = await Chat.findOne({
+                    type: 'direct',
+                    name: { 
+                      $in: [
+                        `${user.username}_${otherUser}`,
+                        `${otherUser}_${user.username}`
+                      ]
+                    }
+                  });
                 }
                 
-                chat = new Chat({
-                  type: 'direct',
-                  participants: [user.username, otherUser],
-                  name: `${user.username}_${otherUser}`,
-                  createdBy: user.username
-                });
-                
-                await chat.save();
-                
-                // Notify the other user about the new chat
-                const otherUserConnections = Array.from(clients.entries())
-                  .filter(([_, client]) => client.user?.username === otherUser);
-                
-                otherUserConnections.forEach(([clientWs]) => {
-                  if (clientWs.readyState === WebSocket.OPEN) {
-                    clientWs.send(JSON.stringify({
-                      type: 'new_chat',
-                      chat: {
-                        ...chat.toObject(),
-                        _id: chat._id.toString(),
-                        lastMessage: null
-                      }
+                // If still no chat, create new one
+                if (!chat) {
+                  // Verify other user exists
+                  const otherUserExists = await User.findOne({ username: otherUser });
+                  if (!otherUserExists) {
+                    ws.send(JSON.stringify({
+                      type: 'error',
+                      content: 'User not found'
                     }));
+                    return;
                   }
-                });
+                  
+                  chat = new Chat({
+                    type: 'direct',
+                    name: `${user.username}_${otherUser}`,
+                    participants: [user.username, otherUser],
+                    createdBy: user.username,
+                    isActive: true
+                  });
+                  
+                  await chat.save();
+                  
+                  // Format the chat object with string ID for consistent handling
+                  const newChatObject = {
+                    ...chat.toObject(),
+                    _id: chat._id.toString(),
+                    lastMessage: null,
+                    otherParticipants: [otherUser]
+                  };
+                  
+                  // Notify the other user about the new chat
+                  const otherUserConnections = Array.from(clients.entries())
+                    .filter(([_, client]) => client.user?.username === otherUser);
+                  
+                  otherUserConnections.forEach(([clientWs]) => {
+                    if (clientWs.readyState === WebSocket.OPEN) {
+                      clientWs.send(JSON.stringify({
+                        type: 'new_chat',
+                        chat: {
+                          ...newChatObject,
+                          otherParticipants: [user.username]
+                        }
+                      }));
+                    }
+                  });
+                  
+                  // Also send the new chat object to the sender to ensure they have it in their chat list
+                  ws.send(JSON.stringify({
+                    type: 'new_chat',
+                    chat: newChatObject
+                  }));
+                }
               }
             }
 
@@ -697,14 +753,30 @@ wss.on('connection', (ws) => {
               await chat.save();
               
               // Format message for broadcasting with string IDs
+              const formattedMessage = {
+                ...messageData,
+                _id: newMessage._id.toString(),
+                chatId: messageData.chatId.toString(),
+                timestamp: messageData.timestamp.toISOString()
+              };
+              
               const broadcastMessage = {
                 type: 'chat_message',
                 chatId: chat._id.toString(),
-                messageData: {
-                  ...messageData,
-                  _id: newMessage._id.toString(),
-                  chatId: messageData.chatId.toString(),
-                  timestamp: messageData.timestamp.toISOString()
+                messageData: formattedMessage
+              };
+
+              // Also send a chat update to ensure both clients have the latest chat object
+              // with the last message data
+              const chatUpdate = {
+                type: 'chat_updated',
+                chat: {
+                  ...chat.toObject(),
+                  _id: chat._id.toString(),
+                  lastMessage: formattedMessage,
+                  lastActivity: new Date().toISOString(),
+                  // Ensure otherParticipants is included for each recipient
+                  otherParticipants: null // Will be set per recipient below
                 }
               };
 
@@ -716,9 +788,29 @@ wss.on('connection', (ws) => {
                 const participantConnections = Array.from(clients.entries())
                   .filter(([_, client]) => client.user?.username === participant);
                   
+                // Set otherParticipants specific to this recipient
+                chatUpdate.chat.otherParticipants = chat.participants.filter(p => p !== participant);
+                
                 participantConnections.forEach(([clientWs]) => {
                   if (clientWs.readyState === WebSocket.OPEN && !messageReceivedBy.has(participant)) {
+                    // Check if this client created the chat with a temporary ID
+                    const tempId = data.originalChatId && data.originalChatId.startsWith('temp-') ? data.originalChatId : null;
+                    
+                    if (tempId && clientWs === ws) {
+                      // If this is the sender and they used a temp ID, include the temp ID in the response
+                      ws.send(JSON.stringify({
+                        type: 'temp_chat_replaced',
+                        tempId: tempId,
+                        realChatId: chat._id.toString()
+                      }));
+                    }
+                    
+                    // Send the chat message
                     clientWs.send(JSON.stringify(broadcastMessage));
+                    
+                    // Also send the updated chat object
+                    clientWs.send(JSON.stringify(chatUpdate));
+                    
                     messageReceivedBy.add(participant);
                     
                     // Send notification if not the sender
@@ -889,31 +981,47 @@ wss.on('connection', (ws) => {
               }
               
               // Check if chat already exists (including deleted ones)
-              const existingChat = await Chat.findOne({
+              // First try to find by participants (most reliable method)
+              let existingChat = await Chat.findOne({
                 type: 'direct',
-                $or: [
-                  { participants: { $all: [user.username, otherUser], $size: 2 } },
-                  { 
-                    name: { 
-                      $in: [
-                        `${user.username}_${otherUser}`,
-                        `${otherUser}_${user.username}`
-                      ]
-                    }
-                  }
-                ]
+                participants: { $all: [user.username, otherUser], $size: 2 }
               });
               
+              // If not found, try by possible name variations
+              if (!existingChat) {
+                existingChat = await Chat.findOne({
+                  type: 'direct',
+                  name: { 
+                    $in: [
+                      `${user.username}_${otherUser}`,
+                      `${otherUser}_${user.username}`
+                    ]
+                  }
+                });
+              }
+              
               if (existingChat) {
+                console.log(`Found existing direct chat between ${user.username} and ${otherUser}:`, existingChat._id);
                 // If chat exists but user was removed, add them back
+                let updated = false;
                 if (!existingChat.participants.includes(user.username)) {
                   existingChat.participants.push(user.username);
+                  updated = true;
                 }
                 if (!existingChat.participants.includes(otherUser)) {
                   existingChat.participants.push(otherUser);
+                  updated = true;
                 }
-                existingChat.isActive = true;
-                await existingChat.save();
+                if (!existingChat.isActive) {
+                  existingChat.isActive = true;
+                  updated = true;
+                }
+                
+                if (updated) {
+                  await existingChat.save();
+                  console.log(`Updated existing chat: ${existingChat._id}`);
+                }
+                
                 newChat = existingChat;
               } else {
                 // Create new direct chat
@@ -953,14 +1061,19 @@ wss.on('connection', (ws) => {
                   const participantConnections = Array.from(clients.entries())
                     .filter(([_, client]) => client.user?.username === participant);
                     
+                  // Create a participant-specific view of the chat with their own otherParticipants
+                  const participantChatView = {
+                    ...newChat.toObject(),
+                    _id: newChat._id.toString(),
+                    otherParticipants: newChat.participants.filter(p => p !== participant),
+                    lastMessage: null
+                  };
+                  
                   participantConnections.forEach(([clientWs]) => {
                     if (clientWs.readyState === WebSocket.OPEN) {
                       clientWs.send(JSON.stringify({
                         type: 'new_chat',
-                        chat: {
-                          ...newChat.toObject(),
-                          _id: newChat._id.toString()
-                        }
+                        chat: participantChatView
                       }));
                     }
                   });
@@ -969,12 +1082,20 @@ wss.on('connection', (ws) => {
             }
             
             // Send the new chat to the creator
+            const formattedNewChat = {
+              ...newChat.toObject(),
+              _id: newChat._id.toString(),
+              // Add otherParticipants array for consistent display in frontend
+              otherParticipants: newChat.type === 'direct' 
+                ? newChat.participants.filter(p => p !== user.username)
+                : newChat.participants.filter(p => p !== user.username),
+              // Add lastMessage as null for new chats
+              lastMessage: null
+            };
+            
             ws.send(JSON.stringify({
               type: 'new_chat',
-              chat: {
-                ...newChat.toObject(),
-                _id: newChat._id.toString()
-              }
+              chat: formattedNewChat
             }));
             
           } catch (error) {
@@ -988,27 +1109,36 @@ wss.on('connection', (ws) => {
 
         case 'logout':
           if (user) {
+            console.log(`User ${user.username} is logging out`);
+            // Always blacklist the token
             blacklistedTokens.add(data.token);
             
             // Get current connection count
             let remainingConnections = 0;
-            clients.forEach((info) => {
-              if (info.user && info.user.username === user.username && info.user !== ws) {
+            clients.forEach((info, clientWs) => {
+              // Only count connections that aren't this one and have the same username
+              if (clientWs !== ws && info.user && info.user.username === user.username) {
                 remainingConnections++;
               }
             });
             
+            console.log(`User ${user.username} has ${remainingConnections} remaining connections`);
+            
             // Only remove from sessions if this is the last connection
             if (remainingConnections === 0) {
+              console.log(`Removing ${user.username} from userSessions`);
               userSessions.delete(user.username);
               // Only broadcast departure if actually logged out completely
               throttledSystemMessage(user.username, 'system', false);
             }
             
-            // Update online users list
-            throttledBroadcastOnlineUsers();
-            
+            // Remove this client from the clients map
             clients.delete(ws);
+            
+            // Make sure online users list is updated immediately
+            broadcastOnlineUsers(); // Use immediate broadcast, not throttled
+            
+            // Reset client state
             ws.isAuthenticated = false;
             user = null;
             sessionId = null;
@@ -1446,11 +1576,12 @@ wss.on('connection', (ws) => {
       
       // Only remove from userSessions if no other connections exist
       if (!otherConnectionsExist) {
+        console.log(`No other connections for ${username}, removing from userSessions`);
         userSessions.delete(username);
         console.log(`User ${username} disconnected. Remaining sessions:`, Array.from(userSessions.keys()));
         
-        // Broadcast updated online users, but throttled
-        throttledBroadcastOnlineUsers();
+        // Broadcast updated online users immediately for disconnection
+        broadcastOnlineUsers();
         
         // Don't send system message immediately, wait longer to see if they reconnect
         setTimeout(() => {
@@ -1464,6 +1595,7 @@ wss.on('connection', (ws) => {
           
           // Only broadcast system message if they haven't reconnected after a significant delay
           if (!reconnected) {
+            console.log(`User ${username} did not reconnect, sending departure message`);
             throttledSystemMessage(username, 'system', false);
           }
         }, 15000); // Wait 15 seconds before announcing departure
@@ -1655,21 +1787,39 @@ app.post('/api/refresh-token', async (req, res) => {
 // Add the logout endpoint
 app.post('/api/logout', (req, res) => {
   const { refreshToken } = req.body;
+  const token = req.headers.authorization?.split(' ')[1];
+  
+  // Add the access token to blacklist if provided
+  if (token) {
+    console.log('Blacklisting access token from logout endpoint');
+    blacklistedTokens.add(token);
+  }
+  
   if (refreshToken) {
     const username = refreshTokens.get(refreshToken);
     if (username) {
-      // Find associated access token to blacklist (optional but good practice)
-      // This requires storing the access token associated with the refresh token
-      // For simplicity, we'll just remove the refresh token for now.
+      console.log(`User ${username} logging out via REST API`);
+      
+      // Check if user has any remaining WebSocket connections
+      let hasActiveConnections = false;
+      clients.forEach((info) => {
+        if (info.user && info.user.username === username) {
+          hasActiveConnections = true;
+        }
+      });
+      
+      // Only remove from userSessions if no WebSocket connections remain
+      if (!hasActiveConnections) {
+        console.log(`Removing ${username} from userSessions via REST logout`);
+        userSessions.delete(username);
+        // Force broadcast updated online users
+        broadcastOnlineUsers();
+      }
+      
+      // Invalidate the refresh token
       refreshTokens.delete(refreshToken);
       console.log(`User ${username} logged out, refresh token invalidated.`);
     }
-    // It's often useful to blacklist the current access token as well
-    // You might need to send the access token in the logout request body or headers
-    // if (req.headers.authorization) {
-    //   const token = req.headers.authorization.split(' ')[1];
-    //   blacklistedTokens.add(token);
-    // }
   }
   res.json({ message: 'Logout successful' });
 });
@@ -1915,6 +2065,101 @@ app.get('/api/users', async (req, res) => {
   } catch (error) {
     console.error('Get users error:', error);
     res.status(500).json({ error: 'Failed to retrieve users' });
+  }
+});
+
+// Get user profile
+app.get('/api/users/:username/profile', async (req, res) => {
+  try {
+    const { username } = req.params;
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    // Verify user is authenticated
+    const decoded = verifyToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    // Find the user
+    const user = await User.findOne({ username })
+      .select('username avatar bio email displayName createdAt lastSeen');
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Get common groups between the requesting user and the target user
+    const commonGroups = await Chat.find({
+      type: 'group',
+      participants: { $all: [decoded.username, username] }
+    }).select('name _id avatar').lean();
+    
+    // Get online status
+    const isOnline = userSessions.has(username);
+    
+    // Calculate time since last seen
+    const lastSeen = userLastSeen.get(username) || user.lastSeen;
+    
+    res.json({
+      profile: {
+        ...user.toObject(),
+        isOnline,
+        lastSeen,
+        commonGroups
+      }
+    });
+  } catch (error) {
+    console.error('Get profile error:', error);
+    res.status(500).json({ error: 'Failed to retrieve profile' });
+  }
+});
+
+// Update user profile 
+app.put('/api/users/:username/profile', async (req, res) => {
+  try {
+    const { username } = req.params;
+    const token = req.headers.authorization?.split(' ')[1];
+    
+    // Verify user is authenticated
+    const decoded = verifyToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    // Users can only update their own profiles
+    if (decoded.username !== username) {
+      return res.status(403).json({ error: 'You can only update your own profile' });
+    }
+    
+    const { bio, email, displayName } = req.body;
+    
+    // Find and update the user
+    const user = await User.findOne({ username });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Update fields if provided
+    if (bio !== undefined) user.bio = bio;
+    if (email !== undefined) user.email = email;
+    if (displayName !== undefined) user.displayName = displayName;
+    
+    await user.save();
+    
+    res.json({
+      message: 'Profile updated successfully',
+      profile: {
+        username: user.username,
+        bio: user.bio,
+        email: user.email,
+        displayName: user.displayName,
+        avatar: user.avatar
+      }
+    });
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
   }
 });
 
@@ -2257,11 +2502,15 @@ app.post('/api/upload', (req, res, next) => {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
+    // Log the complete file object for debugging
+    console.log('Complete file object from Cloudinary:', JSON.stringify(req.file, null, 2));
+    
     console.log('File upload successful:', {
       path: req.file.path,
       filename: req.file.originalname,
       size: req.file.size,
-      mimetype: req.file.mimetype
+      mimetype: req.file.mimetype,
+      secure_url: req.file.secure_url || req.file.path
     });
 
     // Check file size (10MB limit)
@@ -2280,8 +2529,15 @@ app.post('/api/upload', (req, res, next) => {
     // Set proper content type
     res.setHeader('Content-Type', 'application/json');
     
+    // Ensure we get the full Cloudinary URL
+    // Use secure_url if available, otherwise build a secure URL from the path
+    const fileUrl = req.file.secure_url || 
+      (req.file.path.startsWith('http') ? 
+        req.file.path : 
+        `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/raw/upload/${req.file.path.split('/').pop()}`);
+    
     res.json({
-      fileUrl: req.file.path,
+      fileUrl: fileUrl,
       fileName: req.file.originalname,
       fileSize: req.file.size,
       fileType: req.file.mimetype
@@ -2294,3 +2550,46 @@ app.post('/api/upload', (req, res, next) => {
     });
   }
 }); 
+
+// Update user profile picture
+app.post('/api/users/:username/avatar', (req, res, next) => {
+  // Use the optimized avatar upload configuration
+  avatarUpload.single('avatar')(req, res, (err) => {
+    if (err) {
+      console.error('Avatar upload error:', err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('Avatar file object:', req.file);
+    
+    // Get the clean avatar URL from Cloudinary
+    const avatarUrl = req.file.path || req.file.secure_url;
+    console.log('Using avatar URL:', avatarUrl);
+
+    // Update user with new avatar
+    User.findOneAndUpdate(
+      { username: req.params.username }, 
+      { avatar: avatarUrl }, // Changed from avatarUrl to avatar to match schema definition
+      { new: true }
+    )
+    .then(updatedUser => {
+      if (!updatedUser) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      
+      // Return the clean URL in the response
+      return res.json({ 
+        avatarUrl: avatarUrl,
+        message: 'Avatar updated successfully' 
+      });
+    })
+    .catch(error => {
+      console.error('Database error updating avatar:', error);
+      res.status(500).json({ error: 'Failed to update avatar' });
+    });
+  });
+});
